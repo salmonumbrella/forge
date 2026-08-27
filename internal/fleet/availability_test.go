@@ -4,7 +4,59 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestProjectForObserverSuppressesTwoHopMutation(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	full := Capabilities{Commands: CommandCapabilities{
+		WorktreeCreate: true, WorktreeImportPR: true, WorktreeDelete: true,
+		SessionEnsure: true, SessionKill: true, RepositoryClone: true,
+		ProjectAdd: true, ProjectRemove: true,
+	}}
+	nodeA := NodeID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	nodeB := NodeID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	nodeC := NodeID("cccccccccccccccccccccccccccccccc")
+	rawA := RawSnapshot{ProtocolVersion: 3, NodeID: nodeA,
+		Host: RawHost{Hostname: "coordinator", Platform: "linux"}, Capabilities: &full}
+	rawB := RawSnapshot{ProtocolVersion: 3, NodeID: nodeB,
+		Host: RawHost{Hostname: "node-b", Platform: "linux"}, Capabilities: &full}
+	rawC := RawSnapshot{ProtocolVersion: 3, NodeID: nodeC,
+		Host: RawHost{Hostname: "node-c", Platform: "linux"}, Capabilities: &full}
+	aggregate := BuildNeutralAggregate(rawA, []PeerResult{
+		{NodeID: nodeB, Name: "node-b", Reachable: true, Raw: &rawB},
+		{NodeID: nodeC, Name: "node-c", Reachable: true, Raw: &rawC},
+	})
+
+	projected := ProjectForObserver(aggregate, rawB, Observer{NodeID: nodeB, Role: RoleNode})
+	var self, remoteC *HostSummary
+	for index := range projected.Hosts {
+		host := &projected.Hosts[index]
+		switch host.ConfigKey {
+		case string(nodeB):
+			self = host
+		case string(nodeC):
+			remoteC = host
+		}
+	}
+	require.NotNil(self)
+	assert.Equal("self", self.Kind)
+	require.NotNil(remoteC)
+	write := remoteC.OperationAvailability[OpWorkspaceWrite]
+	assert.False(write.Available)
+	require.NotNil(write.UnavailableReason)
+	assert.Equal(ReasonSummaryOnly, *write.UnavailableReason)
+
+	coordinatorView := ProjectForObserver(
+		aggregate, rawA, Observer{NodeID: nodeA, Role: RoleCoordinator},
+	)
+	for _, host := range coordinatorView.Hosts {
+		if host.ConfigKey == string(nodeC) {
+			assert.True(host.OperationAvailability[OpWorkspaceWrite].Available)
+		}
+	}
+}
 
 func fullCommandCaps() CommandCapabilities {
 	return CommandCapabilities{

@@ -25,6 +25,16 @@ supersession, completion events, or pending-state presentation.
 - In-flight cleanup is compare-and-delete on the per-key handle: terminal
   paths clear before broadcasting, so a stale worker's deferred cleanup must
   not remove a newer queue's handle for the same key.
+- Node preparation rejects new deferred-merge admission and counts every
+  already-admitted handle until compare-and-delete cleanup or immediate-merge
+  supersession reaches a known terminal outcome. The preparation acknowledgement
+  generation cannot freeze while this count is nonzero
+  (`internal/server/pullapi/deferred_merge.go::deferredMergeHandle.finish`).
+- Node role never constructs local provider or deferred-merge workers. Active
+  nodes proxy deferred merges through a validated coordinator client;
+  inactive or incompatible nodes reject them without federation egress
+  (`cmd/kenn-forge/provider_startup.go::buildServeControlPlanes`,
+  `internal/server/server.go::Server.serveProviderRoute`).
 - Closing the pull request is the user's only cancel for a queued deferred
   merge; queueing a second one returns 409 `already_pending`, so the UI must
   not offer deferred actions while `deferred_merge_pending` is true.

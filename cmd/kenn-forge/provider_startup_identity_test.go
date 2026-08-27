@@ -86,7 +86,7 @@ func TestRegisterProviderTokenSourcesDefersGitHubAppMinting(t *testing.T) {
 	require.NotEmpty(sources)
 	require.Zero(mints.Load(), "disabled startup must not mint provider credentials")
 
-	_, err = buildProviderStartup(
+	_, err = buildProviderControlPlane(
 		t.Context(), dbtest.Open(t), cfg, set, sources,
 		defaultProviderFactories(), nil,
 	)
@@ -94,7 +94,7 @@ func TestRegisterProviderTokenSourcesDefersGitHubAppMinting(t *testing.T) {
 	require.Zero(mints.Load(), "provider construction must remain lazy")
 }
 
-func TestBuildProviderStartupRetainsVerifiedPATForExactRoutes(t *testing.T) {
+func TestBuildProviderControlPlaneRetainsVerifiedPATForExactRoutes(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	database := dbtest.Open(t)
@@ -112,7 +112,7 @@ func TestBuildProviderStartupRetainsVerifiedPATForExactRoutes(t *testing.T) {
 	sources, err := collectProviderTokenSources(t.Context(), cfg, set)
 	require.NoError(err)
 	var identityLookups atomic.Int32
-	startup, err := buildProviderStartup(
+	startup, err := buildProviderControlPlane(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		fakeGitHubIdentityResolver{
 			byEnv: map[string]github.GitHubIdentity{
@@ -126,9 +126,10 @@ func TestBuildProviderStartupRetainsVerifiedPATForExactRoutes(t *testing.T) {
 	require.NoError(err)
 	startupLookups := identityLookups.Load()
 	assert.Positive(startupLookups)
+	gitRoutes := gitRoutesForProviderControlPlaneTest(t, cfg, set, &startup)
 
 	for _, repo := range []string{"one", "two"} {
-		source := startup.SourceForRepo("github", "github.com", "org-a", repo)
+		source := gitRoutes.SourceForRepo("github", "github.com", "org-a", repo)
 		require.NotNil(source)
 		token, tokenErr := source.Token(t.Context())
 		require.NoError(tokenErr)
@@ -139,6 +140,19 @@ func TestBuildProviderStartupRetainsVerifiedPATForExactRoutes(t *testing.T) {
 }
 
 type tokenGitHubIdentityResolver map[string]github.GitHubIdentity
+
+func gitRoutesForProviderControlPlaneTest(
+	t *testing.T,
+	cfg *config.Config,
+	set *tokenauth.SourceSet,
+	control *providerControlPlane,
+) *gitStartup {
+	t.Helper()
+	routes, err := buildGitStartup(cfg, set)
+	require.NoError(t, err)
+	routes.ApplyProviderControlPlane(control)
+	return &routes
+}
 
 func (r tokenGitHubIdentityResolver) ResolvePAT(
 	ctx context.Context, host string, source tokenauth.Source,
@@ -155,7 +169,7 @@ func (r tokenGitHubIdentityResolver) ResolvePAT(
 	)
 }
 
-func TestBuildProviderStartupDeduplicatesGitHubIdentityRuntimes(t *testing.T) {
+func TestBuildProviderControlPlaneDeduplicatesGitHubIdentityRuntimes(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	database := dbtest.Open(t)
@@ -202,7 +216,7 @@ func TestBuildProviderStartupDeduplicatesGitHubIdentityRuntimes(t *testing.T) {
 		"APP_WRITE_PAT": {Key: github.IdentityKey{Host: "github.com", Principal: "user:123"}},
 	}}
 
-	startup, err := buildProviderStartup(
+	startup, err := buildProviderControlPlane(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(), resolver,
 	)
 	require.NoError(err)
@@ -256,7 +270,8 @@ func TestBuildProviderStartupDeduplicatesGitHubIdentityRuntimes(t *testing.T) {
 	require.True(ok)
 	assert.NotNil(routed)
 
-	gitSource := startup.SourceForRepo("github", "github.com", "org-d", "four")
+	gitRoutes := gitRoutesForProviderControlPlaneTest(t, cfg, set, &startup)
+	gitSource := gitRoutes.SourceForRepo("github", "github.com", "org-d", "four")
 	require.NotNil(gitSource)
 	gitToken, err := gitSource.Token(t.Context())
 	require.NoError(err)
@@ -268,7 +283,7 @@ func TestBuildProviderStartupDeduplicatesGitHubIdentityRuntimes(t *testing.T) {
 // production route construction has to populate it: owner routes sharing one
 // PAT must agree on it even though each route gets its own client and its own
 // scope, while a route on an independent credential must not.
-func TestProviderStartupGivesRoutesSharingOnePATOneCredentialKey(t *testing.T) {
+func TestProviderControlPlaneGivesRoutesSharingOnePATOneCredentialKey(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	database := dbtest.Open(t)
@@ -288,7 +303,7 @@ func TestProviderStartupGivesRoutesSharingOnePATOneCredentialKey(t *testing.T) {
 	sources, err := collectProviderTokenSources(t.Context(), cfg, set)
 	require.NoError(err)
 
-	startup, err := buildProviderStartup(
+	startup, err := buildProviderControlPlane(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		fakeGitHubIdentityResolver{byEnv: map[string]github.GitHubIdentity{
 			"SHARED_PAT":  {Key: github.IdentityKey{Host: "github.com", Principal: "user:123"}},
@@ -320,7 +335,7 @@ func TestProviderStartupGivesRoutesSharingOnePATOneCredentialKey(t *testing.T) {
 // installations that fall back to the same PAT write as one credential even
 // though their read chains differ. Snapshot refresh dedupes write buckets on
 // the write key, so the read key cannot stand in for it.
-func TestProviderStartupSeparatesWriteCredentialKeyFromReadChain(t *testing.T) {
+func TestProviderControlPlaneSeparatesWriteCredentialKeyFromReadChain(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	database := dbtest.Open(t)
@@ -355,7 +370,7 @@ func TestProviderStartupSeparatesWriteCredentialKeyFromReadChain(t *testing.T) {
 	sources, err := collectProviderTokenSources(t.Context(), cfg, set)
 	require.NoError(err)
 
-	startup, err := buildProviderStartup(
+	startup, err := buildProviderControlPlane(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		fakeGitHubIdentityResolver{byEnv: map[string]github.GitHubIdentity{
 			"SHARED_PAT": {Key: github.IdentityKey{Host: "github.com", Principal: "user:123"}},
@@ -379,7 +394,7 @@ func TestProviderStartupSeparatesWriteCredentialKeyFromReadChain(t *testing.T) {
 		"the write chain must not carry App candidates mutations never use")
 }
 
-func TestBuildProviderStartupRoutesUntrackedOwnerAndKeepsFallbackUnscoped(t *testing.T) {
+func TestBuildProviderControlPlaneRoutesUntrackedOwnerAndKeepsFallbackUnscoped(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	database := dbtest.Open(t)
@@ -407,7 +422,7 @@ func TestBuildProviderStartupRoutesUntrackedOwnerAndKeepsFallbackUnscoped(t *tes
 	sources, err := collectProviderTokenSources(t.Context(), cfg, set)
 	require.NoError(err)
 
-	startup, err := buildProviderStartup(
+	startup, err := buildProviderControlPlane(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		fakeGitHubIdentityResolver{byEnv: map[string]github.GitHubIdentity{
 			"ORG_A_PAT":   {Key: github.IdentityKey{Host: "github.com", Principal: "user:123"}},
@@ -415,8 +430,9 @@ func TestBuildProviderStartupRoutesUntrackedOwnerAndKeepsFallbackUnscoped(t *tes
 		}},
 	)
 	require.NoError(err)
+	gitRoutes := gitRoutesForProviderControlPlaneTest(t, cfg, set, &startup)
 
-	source := startup.SourceForRepo(
+	source := gitRoutes.SourceForRepo(
 		"github", "github.com", "org-a", "first-repo",
 	)
 	require.NotNil(source)
@@ -424,12 +440,12 @@ func TestBuildProviderStartupRoutesUntrackedOwnerAndKeepsFallbackUnscoped(t *tes
 	require.NoError(err)
 	assert.Equal("org-a-token", token)
 
-	nonGitHub := startup.SourceForRepo(
+	nonGitHub := gitRoutes.SourceForRepo(
 		"forgejo", "github.com", "org-a", "first-repo",
 	)
 	assert.Nil(nonGitHub, "an unconfigured provider must not borrow another provider's credential")
 
-	fallback := startup.FallbackSource("github.com")
+	fallback := gitRoutes.FallbackSource("github.com")
 	require.NotNil(fallback)
 	assert.NotContains(fallback.Descriptor().CanonicalSourceString(), "ORG_A_PAT")
 	assert.NotContains(fallback.Descriptor().CanonicalSourceString(), "github_app")
@@ -444,13 +460,13 @@ func TestBuildProviderStartupRoutesUntrackedOwnerAndKeepsFallbackUnscoped(t *tes
 	assert.Equal("user:999", fallbackRoute.ReadIdentity.Principal)
 }
 
-// TestProviderStartupKeepsSameHostGitCredentialsProviderScoped drives the
+// TestProviderControlPlaneKeepsSameHostGitCredentialsProviderScoped drives the
 // reachable shared-host configuration — scoped GitHub owner routes plus
 // another provider on the same hostname — through config.Load and
-// buildProviderStartup, then asserts managed Git credential selection through
+// buildProviderControlPlane, then asserts managed Git credential selection through
 // the gitclone.RouteResolver interface that gitclone.Manager consults for
 // every networked operation.
-func TestProviderStartupKeepsSameHostGitCredentialsProviderScoped(t *testing.T) {
+func TestProviderControlPlaneKeepsSameHostGitCredentialsProviderScoped(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	t.Setenv("ORG_A_PAT", "org-a-token")
@@ -502,7 +518,7 @@ token_env = "ORG_A_PAT"
 	sources, err := collectProviderTokenSources(t.Context(), cfg, set)
 	require.NoError(err)
 	database := dbtest.Open(t)
-	startup, err := buildProviderStartup(
+	startup, err := buildProviderControlPlane(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		fakeGitHubIdentityResolver{
 			byEnv: map[string]github.GitHubIdentity{
@@ -514,7 +530,9 @@ token_env = "ORG_A_PAT"
 	)
 	require.NoError(err)
 
-	var routes gitclone.RouteResolver = &startup
+	var routes gitclone.RouteResolver = gitRoutesForProviderControlPlaneTest(
+		t, cfg, set, &startup,
+	)
 	forgejoSource := routes.SourceForRepo("forgejo", host, "acme", "widget")
 	require.NotNil(forgejoSource)
 	forgejoToken, err := forgejoSource.Token(t.Context())
@@ -541,12 +559,12 @@ token_env = "ORG_A_PAT"
 	assert.Equal("unmatched", missing.Owner)
 }
 
-// TestProviderStartupDisablesAmbiguousOwnerlessFallbackOnSharedHost pins the
+// TestProviderControlPlaneDisablesAmbiguousOwnerlessFallbackOnSharedHost pins the
 // shared-host disagreement rule end to end: providers keep their own
 // credentials for repository-scoped operations, while the ownerless host
 // fallback fails closed instead of exposing the GitHub credential for work
 // that may belong to another provider.
-func TestProviderStartupDisablesAmbiguousOwnerlessFallbackOnSharedHost(t *testing.T) {
+func TestProviderControlPlaneDisablesAmbiguousOwnerlessFallbackOnSharedHost(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	t.Setenv("GITHUB_HOST_PAT", "github-secret")
@@ -586,7 +604,7 @@ token_env = "FORGEJO_PAT"
 	sources, err := collectProviderTokenSources(t.Context(), cfg, set)
 	require.NoError(err)
 	database := dbtest.Open(t)
-	startup, err := buildProviderStartup(
+	startup, err := buildProviderControlPlane(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		fakeGitHubIdentityResolver{
 			byEnv: map[string]github.GitHubIdentity{
@@ -598,7 +616,9 @@ token_env = "FORGEJO_PAT"
 	)
 	require.NoError(err)
 
-	var routes gitclone.RouteResolver = &startup
+	var routes gitclone.RouteResolver = gitRoutesForProviderControlPlaneTest(
+		t, cfg, set, &startup,
+	)
 	forgejoSource := routes.SourceForRepo("forgejo", host, "acme", "widget")
 	require.NotNil(forgejoSource)
 	forgejoToken, err := forgejoSource.Token(t.Context())
@@ -661,7 +681,7 @@ func TestSelectedGitHubAppSupportsOwnerPreviewWithoutPATFallback(t *testing.T) {
 	sources, err := collectProviderTokenSources(t.Context(), cfg, set)
 	require.NoError(err)
 	database := dbtest.Open(t)
-	startup, err := buildProviderStartup(
+	startup, err := buildProviderControlPlane(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		fakeGitHubIdentityResolver{},
 	)
@@ -702,7 +722,7 @@ func TestSelectedGitHubAppSupportsOwnerPreviewWithoutPATFallback(t *testing.T) {
 	assert.Equal("Bearer app-token", installationAuth)
 }
 
-func TestBuildProviderStartupProbesImplicitFallbackBestEffort(t *testing.T) {
+func TestBuildProviderControlPlaneProbesImplicitFallbackBestEffort(t *testing.T) {
 	// Load from disk: Load defaults github_token_env to the built-in env
 	// name, so a config that never mentions it is an implicit fallback that
 	// must be probed best-effort: kept when its token resolves, skipped with
@@ -727,7 +747,7 @@ token_env = "ORG_A_PAT"
 	fallbackKey := tokenauth.Key{Platform: "github", Host: "github.com"}
 	buildStartup := func(
 		t *testing.T, resolver fakeGitHubIdentityResolver,
-	) (providerStartup, error) {
+	) (providerControlPlane, error) {
 		t.Helper()
 		cfg := loadConfig(t)
 		set := tokenauth.NewSourceSet(tokenauth.Options{
@@ -737,7 +757,7 @@ token_env = "ORG_A_PAT"
 		})
 		sources, err := collectProviderTokenSources(t.Context(), cfg, set)
 		require.NoError(t, err)
-		return buildProviderStartup(
+		return buildProviderControlPlane(
 			t.Context(), dbtest.Open(t), cfg, set, sources,
 			defaultProviderFactories(), resolver,
 		)
@@ -912,7 +932,7 @@ func TestProductionStartupRoutesTwoOwnersThroughSyncAndMutationAPI(t *testing.T)
 	sources, err := collectProviderTokenSources(t.Context(), cfg, set)
 	require.NoError(err)
 	database := dbtest.Open(t)
-	startup, err := buildProviderStartup(
+	startup, err := buildProviderControlPlane(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		github.HTTPIdentityResolver{},
 	)
@@ -1030,7 +1050,7 @@ func TestProductionStartupRoutesExposeRotatedPATThroughRepoAPI(t *testing.T) {
 		"writer-a": {Key: github.IdentityKey{Host: "github.com", Principal: "user:123"}},
 		"writer-b": {Key: github.IdentityKey{Host: "github.com", Principal: "user:456"}},
 	}
-	startup, err := buildProviderStartup(
+	startup, err := buildProviderControlPlane(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(), resolver,
 	)
 	require.NoError(err)
@@ -1094,7 +1114,7 @@ func TestProductionStartupRoutesExposeRotatedPATThroughRepoAPI(t *testing.T) {
 	}
 }
 
-func TestBuildProviderStartupAllowsAppOnlyReadRouteButRequiresRestartForManagedGit(t *testing.T) {
+func TestBuildProviderControlPlaneAllowsAppOnlyReadRouteButRequiresRestartForManagedGit(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	database := dbtest.Open(t)
@@ -1141,7 +1161,7 @@ func TestBuildProviderStartupAllowsAppOnlyReadRouteButRequiresRestartForManagedG
 	sources, err := collectProviderTokenSources(t.Context(), cfg, set)
 	require.NoError(err)
 
-	startup, err := buildProviderStartup(
+	startup, err := buildProviderControlPlane(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		fakeGitHubIdentityResolver{},
 	)
@@ -1151,9 +1171,10 @@ func TestBuildProviderStartupAllowsAppOnlyReadRouteButRequiresRestartForManagedG
 	}]
 	assert.Equal("installation:789", route.readIdentity.Principal)
 	assert.Empty(route.writeIdentity.Principal)
+	gitRoutes := gitRoutesForProviderControlPlaneTest(t, cfg, set, &startup)
 
 	t.Setenv("LATE_PAT", "appeared-after-startup")
-	manager := gitclone.New(t.TempDir(), &startup)
+	manager := gitclone.New(t.TempDir(), gitRoutes)
 	_, err = manager.RunGitForRepo(
 		t.Context(), "github", host, "org-app", "one", "",
 		"ls-remote", gitServer.URL+"/org-app/one.git",
@@ -1172,7 +1193,7 @@ func TestBuildProviderStartupAllowsAppOnlyReadRouteButRequiresRestartForManagedG
 	})
 	restartedSources, err := collectProviderTokenSources(t.Context(), cfg, restartedSet)
 	require.NoError(err)
-	restarted, err := buildProviderStartup(
+	restarted, err := buildProviderControlPlane(
 		t.Context(), database, cfg, restartedSet, restartedSources,
 		defaultProviderFactories(), tokenGitHubIdentityResolver{
 			"appeared-after-startup": {
@@ -1181,8 +1202,11 @@ func TestBuildProviderStartupAllowsAppOnlyReadRouteButRequiresRestartForManagedG
 		},
 	)
 	require.NoError(err)
+	restartedRoutes := gitRoutesForProviderControlPlaneTest(
+		t, cfg, restartedSet, &restarted,
+	)
 
-	restartedManager := gitclone.New(t.TempDir(), &restarted)
+	restartedManager := gitclone.New(t.TempDir(), restartedRoutes)
 	_, err = restartedManager.RunGitForRepo(
 		t.Context(), "github", host, "org-app", "one", "",
 		"ls-remote", gitServer.URL+"/org-app/one.git",
@@ -1198,7 +1222,7 @@ func TestBuildProviderStartupAllowsAppOnlyReadRouteButRequiresRestartForManagedG
 	}
 }
 
-func TestBuildProviderStartupReportsSafeGitHubIdentityResolutionFailure(t *testing.T) {
+func TestBuildProviderControlPlaneReportsSafeGitHubIdentityResolutionFailure(t *testing.T) {
 	require := require.New(t)
 	database := dbtest.Open(t)
 	t.Setenv("ORG_A_TOKEN", "super-secret-token")
@@ -1220,7 +1244,7 @@ func TestBuildProviderStartupReportsSafeGitHubIdentityResolutionFailure(t *testi
 	sources, err := collectProviderTokenSources(t.Context(), cfg, set)
 	require.NoError(err)
 
-	_, err = buildProviderStartup(
+	_, err = buildProviderControlPlane(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		fakeGitHubIdentityResolver{err: map[string]error{
 			"ORG_A_TOKEN": fmt.Errorf("identity lookup failed"),
@@ -1231,7 +1255,7 @@ func TestBuildProviderStartupReportsSafeGitHubIdentityResolutionFailure(t *testi
 	assert.NotContains(t, err.Error(), "super-secret-token")
 }
 
-func TestBuildProviderStartupOrDegradedKeepsServerBootableWhenGitHubUnavailable(t *testing.T) {
+func TestBuildProviderControlPlaneOrDegradedKeepsServerBootableWhenGitHubUnavailable(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	database := dbtest.Open(t)
@@ -1252,7 +1276,7 @@ func TestBuildProviderStartupOrDegradedKeepsServerBootableWhenGitHubUnavailable(
 	sources, err := collectProviderTokenSources(t.Context(), cfg, set)
 	require.NoError(err)
 
-	startup, err := buildProviderStartupOrDegraded(
+	startup, err := buildProviderControlPlaneOrDegraded(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		fakeGitHubIdentityResolver{err: map[string]error{
 			"ORG_A_TOKEN": errors.New("GitHub API unavailable: 503"),
@@ -1291,7 +1315,7 @@ func TestCollectProviderTokenSourcesDegradedExcludesFailedHost(t *testing.T) {
 	assert.NotContains(sources, providerHostKey("github", "github.com"))
 }
 
-func TestBuildProviderStartupOrDegradedKeepsHealthyProvidersWhenGitHubFails(t *testing.T) {
+func TestBuildProviderControlPlaneOrDegradedKeepsHealthyProvidersWhenGitHubFails(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	database := dbtest.Open(t)
@@ -1316,7 +1340,7 @@ func TestBuildProviderStartupOrDegradedKeepsHealthyProvidersWhenGitHubFails(t *t
 	sources, err := collectProviderTokenSourcesDegraded(t.Context(), cfg, set)
 	require.NoError(err)
 
-	startup, err := buildProviderStartupOrDegraded(
+	startup, err := buildProviderControlPlaneOrDegraded(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		fakeGitHubIdentityResolver{err: map[string]error{
 			"ORG_A_TOKEN": errors.New("GitHub API unavailable: 503"),
@@ -1326,15 +1350,13 @@ func TestBuildProviderStartupOrDegradedKeepsHealthyProvidersWhenGitHubFails(t *t
 	require.Len(startup.registry.Providers(), 1,
 		"the healthy GitLab host must keep syncing")
 	assert.Empty(startup.githubClients)
-	assert.NotContains(startup.cloneSources, tokenauth.Key{
-		Platform: "github", Host: "github.com",
-	})
-	assert.Contains(startup.cloneSources, tokenauth.Key{
-		Platform: "gitlab", Host: "gitlab.example.com",
-	})
+	_, gitLabErr := startup.registry.RepositoryReader(
+		platform.KindGitLab, "gitlab.example.com",
+	)
+	assert.NoError(gitLabErr)
 }
 
-func TestBuildProviderStartupOrDegradedIsolatesFailingGitHubHost(t *testing.T) {
+func TestBuildProviderControlPlaneOrDegradedIsolatesFailingGitHubHost(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	database := dbtest.Open(t)
@@ -1359,7 +1381,7 @@ func TestBuildProviderStartupOrDegradedIsolatesFailingGitHubHost(t *testing.T) {
 	sources, err := collectProviderTokenSourcesDegraded(t.Context(), cfg, set)
 	require.NoError(err)
 
-	startup, err := buildProviderStartupOrDegraded(
+	startup, err := buildProviderControlPlaneOrDegraded(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		fakeGitHubIdentityResolver{
 			byEnv: map[string]github.GitHubIdentity{
@@ -1373,12 +1395,10 @@ func TestBuildProviderStartupOrDegradedIsolatesFailingGitHubHost(t *testing.T) {
 		},
 	)
 	require.NoError(err)
-	assert.NotContains(startup.cloneSources, tokenauth.Key{
-		Platform: "github", Host: "github.com",
-	}, "the unavailable GitHub host must degrade to cached data")
-	assert.Contains(startup.cloneSources, tokenauth.Key{
-		Platform: "github", Host: "ghe.example.com",
-	}, "the healthy GitHub host must keep syncing")
+	assert.NotContains(startup.githubClients, "github.com",
+		"the unavailable GitHub host must degrade to cached data")
+	assert.Contains(startup.githubClients, "ghe.example.com",
+		"the healthy GitHub host must keep syncing")
 }
 
 // A repository PAT override picks the credential that signs that repository's
@@ -1435,7 +1455,7 @@ func TestSelectedGitHubAppKeepsOwnerDiscoveryWhenRepoOverridesPAT(t *testing.T) 
 	sources, err := collectProviderTokenSources(t.Context(), cfg, set)
 	require.NoError(err)
 	database := dbtest.Open(t)
-	startup, err := buildProviderStartup(
+	startup, err := buildProviderControlPlane(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		tokenGitHubIdentityResolver{"repo-pat": {
 			Key:   github.IdentityKey{Host: host, Principal: "user:5"},
@@ -1443,8 +1463,9 @@ func TestSelectedGitHubAppKeepsOwnerDiscoveryWhenRepoOverridesPAT(t *testing.T) 
 		}},
 	)
 	require.NoError(err)
+	gitRoutes := gitRoutesForProviderControlPlaneTest(t, cfg, set, &startup)
 
-	source := startup.SourceForRepo("github", host, "acme", "covered")
+	source := gitRoutes.SourceForRepo("github", host, "acme", "covered")
 	require.NotNil(source)
 	writeToken, err := source.Token(t.Context())
 	require.NoError(err)
@@ -1527,15 +1548,16 @@ func TestManagedGitFailsClosedForUnroutedGitHubRepository(t *testing.T) {
 	})
 	sources, err := collectProviderTokenSources(t.Context(), cfg, set)
 	require.NoError(err)
-	startup, err := buildProviderStartup(
+	startup, err := buildProviderControlPlane(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		tokenGitHubIdentityResolver{"acme-secret": {
 			Key: github.IdentityKey{Host: host, Principal: "user:1"},
 		}},
 	)
 	require.NoError(err)
+	gitRoutes := gitRoutesForProviderControlPlaneTest(t, cfg, set, &startup)
 
-	manager := gitclone.New(t.TempDir(), &startup)
+	manager := gitclone.New(t.TempDir(), gitRoutes)
 	_, err = manager.RunGitForRepo(
 		t.Context(), "github", host, "other", "thing", "",
 		"ls-remote", gitServer.URL+"/other/thing.git",
@@ -1614,7 +1636,7 @@ func TestAppOnlySelectedGlobStartsWithoutPATAndResolvesMissingPATOnce(t *testing
 
 		// This resolver resolves the mutation chain for real, so an uncached
 		// missing-PAT verdict reaches the gh CLI candidate once per route.
-		startup, err := buildProviderStartup(
+		startup, err := buildProviderControlPlane(
 			t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 			tokenGitHubIdentityResolver{},
 		)

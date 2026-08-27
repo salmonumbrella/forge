@@ -11,8 +11,16 @@ import (
 	"go.kenn.io/forge/internal/db"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/platform"
+	"go.kenn.io/forge/internal/providerplane"
+	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/testutil/dbtest"
 )
+
+type nodePreparationRejectingAdmitter struct{}
+
+func (nodePreparationRejectingAdmitter) Admit(context.Context) (func(), error) {
+	return nil, providerplane.ErrNodePreparationInProgress
+}
 
 type autoAssignProvider struct {
 	pull          platform.MergeRequest
@@ -104,9 +112,10 @@ func TestAutoAssignWorkspaceItemPreservesExistingAssignees(t *testing.T) {
 	syncer := ghclient.NewSyncerWithRegistry(registry, database, nil, nil, time.Hour, nil, nil)
 	t.Cleanup(syncer.Stop)
 	handler := New(Deps{
-		DB:     database,
-		Syncer: syncer,
-		Config: ConfigSnapshot{AutoAssignOnCreate: true},
+		DB:       database,
+		Resolver: httpapi.NewRepositoryResolver(httpapi.RepositoryResolverDeps{DB: database}),
+		Syncer:   syncer,
+		Config:   ConfigSnapshot{AutoAssignOnCreate: true},
 	})
 	repo, err := database.GetRepoByIdentity(t.Context(), repoIdentity)
 	require.NoError(err)
@@ -155,6 +164,23 @@ func TestAutoAssignWorkspaceItemPreservesExistingAssignees(t *testing.T) {
 		})
 	}
 
+	// The node owns the auto-assignment preference and calls this service only
+	// after applying it. The coordinator must execute that request even when
+	// its own local workspace preference differs.
+	handler.config.AutoAssignOnCreate = false
+	provider.pullAssigned = nil
+	require.NoError(handler.AutoAssignProviderWorkspaceItem(
+		t.Context(), ProviderWorkspaceItemRequest{
+			Repository: providerplane.RepositoryRoute{
+				Provider: string(platform.KindGitLab), PlatformHost: "git.example.test",
+				Owner: "acme", Name: "widget",
+			},
+			ItemType: db.WorkspaceItemTypePullRequest, ItemNumber: 7,
+		},
+	))
+	assert.Equal([]string{"reviewer", "maintainer"}, provider.pullAssigned)
+	handler.config.AutoAssignOnCreate = true
+
 	_, err = database.WriteDB().ExecContext(t.Context(), `
 		INSERT INTO forge_archive_items (
 			repo_id, item_type, item_number, provider_item_id,
@@ -174,4 +200,16 @@ func TestAutoAssignWorkspaceItemPreservesExistingAssignees(t *testing.T) {
 	require.ErrorContains(err, "not visible")
 	assert.Empty(provider.pullAssigned)
 	assert.Empty(provider.issueAssigned)
+}
+
+func TestNodePreparationBlocksWorkspaceAutoAssignBeforeProviderAccess(t *testing.T) {
+	handler := &Handler{
+		syncer:            &ghclient.Syncer{},
+		config:            ConfigSnapshot{AutoAssignOnCreate: true},
+		providerWriteGate: nodePreparationRejectingAdmitter{},
+	}
+	err := handler.autoAssignWorkspaceItem(
+		t.Context(), db.Repo{}, 7, false, false,
+	)
+	require.ErrorIs(t, err, providerplane.ErrNodePreparationInProgress)
 }

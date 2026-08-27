@@ -29,6 +29,7 @@
   } from "../../utils/activitySelection.js";
   import RepoTypeahead from "../RepoTypeahead.svelte";
   import HeaderIconButton from "./HeaderIconButton.svelte";
+  import ForgeSelector from "./ForgeSelector.svelte";
   import ThemeToggle from "./ThemeToggle.svelte";
   import {
     ChevronDownIcon,
@@ -392,6 +393,7 @@
       <img class="app-icon" src={appIconSrc} alt="" aria-hidden="true" />
       <span class="logo">kenn-forge</span>
     </span>
+    <ForgeSelector />
     {#if showProviderRepoSelector}
       <RepoTypeahead
         selected={getGlobalRepo()}

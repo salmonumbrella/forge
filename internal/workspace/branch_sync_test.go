@@ -43,7 +43,7 @@ func TestPushWorktreeBranchPushesAheadCommitsAndRunsHooks(t *testing.T) {
 	runWorkspaceTestGit(t, work, "add", ".")
 	runWorkspaceTestGit(t, work, "commit", "-m", "ahead")
 
-	require.NoError(branchSyncTestManager(t).PushWorktreeBranch(t.Context(), "github", "", "", "", work))
+	require.NoError(branchSyncTestManager(t).PushWorktreeBranch(t.Context(), "", "github", "", "", "", work))
 
 	div, ok, err := WorktreeDivergence(t.Context(), work)
 	require.NoError(err)
@@ -69,7 +69,7 @@ func TestPullWorktreeBranchFastForwardsBehindBranch(t *testing.T) {
 	runWorkspaceTestGit(t, other, "commit", "-m", "remote extra")
 	runWorkspaceTestGit(t, other, "push", "origin", "feature")
 
-	require.NoError(branchSyncTestManager(t).PullWorktreeBranch(t.Context(), "github", "", "", "", work))
+	require.NoError(branchSyncTestManager(t).PullWorktreeBranch(t.Context(), "", "github", "", "", "", work))
 
 	contents, err := os.ReadFile(filepath.Join(work, "f.txt"))
 	require.NoError(err)
@@ -102,7 +102,7 @@ func TestPushWorktreeBranchRejectsDivergedBranch(t *testing.T) {
 	runWorkspaceTestGit(t, other, "commit", "-m", "remote")
 	runWorkspaceTestGit(t, other, "push", "origin", "feature")
 
-	err := branchSyncTestManager(t).PushWorktreeBranch(t.Context(), "github", "", "", "", work)
+	err := branchSyncTestManager(t).PushWorktreeBranch(t.Context(), "", "github", "", "", "", work)
 
 	require.Error(err)
 	assert.New(t).ErrorIs(err, ErrWorktreeDiverged)
@@ -114,7 +114,7 @@ func TestPushWorktreeBranchRejectsNonOriginUpstream(t *testing.T) {
 	runWorkspaceTestGit(t, work, "config", "branch.feature.remote", "other")
 
 	err := branchSyncTestManager(t).PushWorktreeBranch(
-		t.Context(), "github", "github.com", "acme", "widgets", work,
+		t.Context(), "", "github", "github.com", "acme", "widgets", work,
 	)
 
 	require.Error(t, err)
@@ -129,7 +129,7 @@ func TestPullWorktreeBranchRejectsDirtyWorktree(t *testing.T) {
 		filepath.Join(work, "dirty.txt"), []byte("dirty\n"), 0o644,
 	))
 
-	err := branchSyncTestManager(t).PullWorktreeBranch(t.Context(), "github", "", "", "", work)
+	err := branchSyncTestManager(t).PullWorktreeBranch(t.Context(), "", "github", "", "", "", work)
 
 	require.Error(err)
 	assert.New(t).ErrorIs(err, ErrWorktreeDirty)
@@ -220,7 +220,7 @@ exec "$real" "$@"
 		t.TempDir(), gitclone.HostSources{"github.com": source},
 	))
 
-	require.NoError(mgr.PushWorktreeBranch(t.Context(), "github", "github.com", "acme", "widgets", work))
+	require.NoError(mgr.PushWorktreeBranch(t.Context(), "", "github", "github.com", "acme", "widgets", work))
 
 	data, err := os.ReadFile(capturePath)
 	require.NoError(err)
@@ -261,7 +261,7 @@ func TestPushWorktreeBranchRejectsAmbiguousRoute(t *testing.T) {
 	mgr := NewManager(d, t.TempDir())
 
 	err := mgr.PushWorktreeBranch(
-		t.Context(), "github", "github.com", "acme", "widget", t.TempDir(),
+		t.Context(), "", "github", "github.com", "acme", "widget", t.TempDir(),
 	)
 	require.ErrorContains(err, "historical occupants",
 		"push must fail closed on a route with contested history")
@@ -274,8 +274,70 @@ func TestPullWorktreeBranchRejectsAmbiguousRoute(t *testing.T) {
 	mgr := NewManager(d, t.TempDir())
 
 	err := mgr.PullWorktreeBranch(
-		t.Context(), "github", "github.com", "acme", "widget", t.TempDir(),
+		t.Context(), "", "github", "github.com", "acme", "widget", t.TempDir(),
 	)
 	require.ErrorContains(err, "historical occupants",
 		"pull must fail closed on a route with contested history")
+}
+
+func TestLaunchSpecBranchSyncRefreshesExpiredLeaseBeforeGit(t *testing.T) {
+	require := require.New(t)
+	database := openTestDB(t)
+	spec := launchSpecForTest()
+	workspace := &db.Workspace{
+		ID: "ws-expired-branch-sync", Platform: spec.Repository.Provider,
+		PlatformHost: spec.Repository.PlatformHost,
+		RepoOwner:    spec.Repository.Owner, RepoName: spec.Repository.Name,
+		ItemType: spec.ItemType, ItemNumber: spec.ItemNumber,
+		ItemKey: spec.ItemKey, GitHeadRef: spec.GitHeadRef,
+		WorkspaceBranch: "kenn-forge/pr-7", WorktreePath: t.TempDir(),
+		TmuxSession: "forge-ws-expired-branch-sync", Status: "ready",
+	}
+	require.NoError(database.InsertWorkspace(t.Context(), workspace))
+	require.NoError(database.PutWorkspaceLaunchSpec(t.Context(), workspace.ID, spec))
+	manager := NewManager(database, t.TempDir())
+	manager.SetNow(func() time.Time { return spec.SourceVisibleUntil })
+	manager.SetLaunchSpecResolver(unavailableLaunchSpecResolver{})
+
+	err := manager.PushWorktreeBranch(
+		t.Context(), workspace.ID, workspace.Platform, workspace.PlatformHost,
+		workspace.RepoOwner, workspace.RepoName, workspace.WorktreePath,
+	)
+
+	require.ErrorIs(err, ErrLaunchSpecRefreshRequired)
+	assert.True(t, LaunchSpecErrorRetryable(err))
+}
+
+func TestProviderBackedBranchSyncDoesNotFallBackToAnonymousGit(t *testing.T) {
+	require := require.New(t)
+	work := setupDivergenceWorktree(t)
+	require.NoError(os.WriteFile(
+		filepath.Join(work, "f.txt"), []byte("ahead\n"), 0o644,
+	))
+	runWorkspaceTestGit(t, work, "add", ".")
+	runWorkspaceTestGit(t, work, "commit", "-m", "ahead")
+	database := openTestDB(t)
+	spec := launchSpecForTest()
+	workspace := &db.Workspace{
+		ID: "ws-required-branch-credential", Platform: spec.Repository.Provider,
+		PlatformHost: spec.Repository.PlatformHost,
+		RepoOwner:    spec.Repository.Owner, RepoName: spec.Repository.Name,
+		ItemType: spec.ItemType, ItemNumber: spec.ItemNumber,
+		ItemKey: spec.ItemKey, GitHeadRef: spec.GitHeadRef,
+		WorkspaceBranch: "feature", WorktreePath: work,
+		TmuxSession: "forge-ws-required-branch-credential", Status: "ready",
+	}
+	require.NoError(database.InsertWorkspace(t.Context(), workspace))
+	require.NoError(database.PutWorkspaceLaunchSpec(t.Context(), workspace.ID, spec))
+	manager := NewManager(database, t.TempDir())
+	manager.SetNow(func() time.Time { return spec.IssuedAt })
+	manager.SetClones(gitclone.New(t.TempDir(), nil))
+	manager.SetRequireProviderCredential(true)
+
+	err := manager.PushWorktreeBranch(
+		t.Context(), workspace.ID, workspace.Platform, workspace.PlatformHost,
+		workspace.RepoOwner, workspace.RepoName, workspace.WorktreePath,
+	)
+
+	require.ErrorIs(err, gitclone.ErrCredentialUnavailable)
 }

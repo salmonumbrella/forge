@@ -1,16 +1,46 @@
 import { Effect } from "effect";
-import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { makeAppRuntime, type OwnedAppRuntime } from "./runtime.js";
 import { createAppStores } from "../app-stores.svelte.js";
 
 let runtime: OwnedAppRuntime;
+let eventSources: EventSourceStub[];
+
+class EventSourceStub {
+  readonly handlers = new Map<string, Set<(event: Event) => void>>();
+
+  constructor(readonly url: string) {
+    eventSources.push(this);
+  }
+
+  addEventListener(name: string, handler: (event: Event) => void): void {
+    const handlers = this.handlers.get(name) ?? new Set();
+    handlers.add(handler);
+    this.handlers.set(name, handlers);
+  }
+
+  removeEventListener(name: string, handler: (event: Event) => void): void {
+    this.handlers.get(name)?.delete(handler);
+  }
+
+  close(): void {}
+}
+
+function emit(source: EventSourceStub, name: string, payload: unknown): void {
+  const event = new MessageEvent(name, { data: JSON.stringify(payload) });
+  for (const handler of source.handlers.get(name) ?? []) handler(event);
+}
 
 beforeEach(() => {
+  eventSources = [];
+  vi.stubGlobal("EventSource", EventSourceStub);
   runtime = makeAppRuntime();
 });
 
 afterEach(async () => {
   await Effect.runPromise(runtime.disposeEffect);
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("app store composition", () => {
@@ -28,5 +58,38 @@ describe("app store composition", () => {
     expect(composition.stores.issues.getIssues()).toEqual([]);
     expect(composition.stores.activity.getActivityItems()).toEqual([]);
     expect(composition.stores.grouping.getGroupByRepo()).toBe(true);
+  });
+
+  it("keeps provider data unavailable when reconnect reconciliation fails", async () => {
+    const failures: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            type: "about:blank",
+            title: "Not Found",
+            status: 404,
+            detail: "provider snapshot unavailable",
+            code: "notFound",
+          }),
+          { status: 404, headers: { "content-type": "application/problem+json" } },
+        ),
+      ),
+    );
+    const composition = createAppStores({ runtime, onError: (message) => failures.push(message) });
+    runtime.runCommand(composition.stores.events.streamEffect, {
+      operation: "test provider events",
+      safeContext: {},
+      onFailure: () => {},
+    });
+    await vi.waitFor(() => expect(eventSources).toHaveLength(1));
+
+    emit(eventSources[0]!, "coordinator_connection_changed", { connected: false });
+    await vi.waitFor(() => expect(composition.stores.sync.getProviderAvailable()).toBe(false));
+    emit(eventSources[0]!, "coordinator_connection_changed", { connected: true });
+
+    await vi.waitFor(() => expect(failures).toHaveLength(1));
+    expect(composition.stores.sync.getProviderAvailable()).toBe(false);
   });
 });

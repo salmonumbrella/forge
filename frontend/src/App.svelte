@@ -42,6 +42,7 @@
   } from "./lib/context.js";
 
   import AppHeader from "./lib/components/layout/AppHeader.svelte";
+  import ForgeSelector from "./lib/components/layout/ForgeSelector.svelte";
   import StatusBar from "./lib/components/layout/StatusBar.svelte";
   import Palette from "./lib/components/keyboard/Palette.svelte";
   import Cheatsheet from "./lib/components/keyboard/Cheatsheet.svelte";
@@ -588,6 +589,23 @@
     return getPage() === "focus" || shouldUseResponsiveFocusPresentation();
   }
 
+  const providerPages = new Set([
+    "activity",
+    "focus",
+    "issues",
+    "mobile-activity",
+    "mobile-issues",
+    "mobile-pulls",
+    "pulls",
+    "repos",
+  ]);
+
+  function providerUnavailable(): boolean {
+    return appReady
+      && providerPages.has(getPage())
+      && stores?.sync.getProviderAvailable() === false;
+  }
+
   function useFocusLayoutClass(): boolean {
     return isPhoneLikeViewport() || shouldForceMobileRoutes();
   }
@@ -1095,7 +1113,9 @@
       class="focus-layout"
       class:focus-layout--phone={useFocusLayoutClass()}
     >
-      {#if r.page === "focus" && r.itemType === "mrs"}
+      {#if providerUnavailable()}
+        {@render providerUnavailableState()}
+      {:else if r.page === "focus" && r.itemType === "mrs"}
         <FocusListView
           listType="mrs"
           {...r.repo ? { repo: r.repo } : {}}
@@ -1170,7 +1190,7 @@
       <header class="mobile-topbar" {@attach trackMobileHeaderHeight}>
         <span class="mobile-brand">
           <img class="mobile-app-icon" src={appIconSrc} alt="" aria-hidden="true" />
-          <span class="mobile-title">kenn-forge</span>
+          <ForgeSelector compact fallbackLabel="kenn-forge" />
         </span>
 
         <MobileModePicker
@@ -1196,6 +1216,8 @@
             <Spinner size={18} />
             Loading
           </div>
+        {:else if providerUnavailable()}
+          {@render providerUnavailableState()}
         {:else if getPage() === "mobile-workspaces"}
           <MobileWorkspaceList
             onOpen={openMobileWorkspaceFromList}
@@ -1271,6 +1293,8 @@
           <Spinner size={18} />
           Loading
         </div>
+      {:else if providerUnavailable()}
+        {@render providerUnavailableState()}
       {:else if getPage() === "settings"}
         <SettingsPage />
       {:else if getPage() === "activity"}
@@ -1433,6 +1457,13 @@
 <!-- Handed to every detail view: the controls themselves come from the hosted
      workspace's live view, and this component is the popover that holds them in a
      pane's tab strip. Declared here because the root owns the workspace slot. -->
+{#snippet providerUnavailableState()}
+  <section class="provider-unavailable-state" role="status" aria-live="polite">
+    <h1>Provider data unavailable</h1>
+    <p>This Forge node cannot reach its coordinator. Local workspaces remain available.</p>
+  </section>
+{/snippet}
+
 {#snippet workspacePaneControls(showStripActions: boolean)}
   <WorkspacePaneControls {showStripActions} />
 {/snippet}
@@ -1485,13 +1516,6 @@
     width: 19px;
     height: 19px;
     flex: 0 0 auto;
-  }
-
-  .mobile-title {
-    color: var(--text-primary);
-    font-size: var(--font-size-md);
-    font-weight: 700;
-    letter-spacing: -0.01em;
   }
 
   .mobile-desktop-link {
@@ -1732,6 +1756,34 @@
     color: var(--text-muted);
     font-size: var(--font-size-sm);
     animation: fade-in 0.3s ease;
+  }
+
+  .provider-unavailable-state {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 24px;
+    text-align: center;
+  }
+
+  .provider-unavailable-state h1,
+  .provider-unavailable-state p {
+    margin: 0;
+  }
+
+  .provider-unavailable-state h1 {
+    color: var(--accent-red);
+    font-size: var(--font-size-lg);
+  }
+
+  .provider-unavailable-state p {
+    max-width: 44ch;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
   }
 
   .feature-shell {

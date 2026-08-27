@@ -204,8 +204,24 @@ describe("createEventsStore event dispatch", () => {
     const onReconnectStale = vi.fn(() => Effect.void);
     const store = createEventsStore({ onReconnectStale });
     start(store);
-    emit(await awaitSource(), "reconnect.stale", { data: "{}" });
-    await vi.waitFor(() => expect(onReconnectStale).toHaveBeenCalledTimes(1));
+    emit(await awaitSource(), "reconnect.stale", {
+      data: JSON.stringify({ coordinator_connected: false }),
+    });
+    await vi.waitFor(() => expect(onReconnectStale).toHaveBeenCalledWith({ coordinator_connected: false }));
+  });
+
+  it("routes coordinator availability through the shared event source", async () => {
+    const onCoordinatorConnectionChanged = vi.fn(() => Effect.void);
+    const store = createEventsStore({ onCoordinatorConnectionChanged });
+    start(store);
+    const source = await awaitSource();
+
+    emit(source, "coordinator_connection_changed", {
+      data: JSON.stringify({ connected: false }),
+    });
+
+    await vi.waitFor(() => expect(onCoordinatorConnectionChanged).toHaveBeenCalledWith({ connected: false }));
+    expect(instances).toHaveLength(1);
   });
 
   it("parses pushed-head refresh events and routes them to callbacks", async () => {

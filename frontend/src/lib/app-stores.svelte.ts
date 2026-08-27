@@ -228,6 +228,19 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
     }
   }
 
+  function reconcileProviderState() {
+    return Effect.all(
+      [
+        pullsStore.reconcilePullsEffect(),
+        issuesStore.reconcileIssuesEffect(),
+        activityStore.reconcileActivityEffect(),
+        refreshSelectedActivityDetail(),
+        syncStore.reconcileSyncStatusEffect,
+      ],
+      { concurrency: "unbounded", discard: true },
+    );
+  }
+
   const eventBasePath = cfg.basePath;
   const eventsStore = createEventsStore({
     runtime: appRuntime,
@@ -236,6 +249,12 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
     }),
     onDataChanged: refreshVisibleData,
     onSyncStatus: (status) => Effect.sync(() => syncStore.setSyncStatus(status)),
+    onCoordinatorConnectionChanged: ({ connected }) => {
+      if (!connected) {
+        return Effect.sync(() => syncStore.setProviderAvailable(false));
+      }
+      return reconcileProviderState().pipe(Effect.andThen(Effect.sync(() => syncStore.setProviderAvailable(true))));
+    },
     onConfigChanged: handleConfigChanged,
     onWorkspaceDeleted: (event) =>
       Effect.gen(function* () {
@@ -329,24 +348,18 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
           }
         });
       }),
-    onReconnectStale: () =>
-      Effect.gen(function* () {
-        // The replay ring rolled past the client's cursor while it
-        // was disconnected (long sleep, extended network outage).
-        // Refetch view state from scratch instead of relying on the
-        // missed broadcasts. sync.refreshSyncStatus() picks up the
-        // current daemon state since no sync_status frame will replay.
-        yield* Effect.all(
-          [
-            pullsStore.reconcilePullsEffect(),
-            issuesStore.reconcileIssuesEffect(),
-            activityStore.reconcileActivityEffect(),
-            refreshSelectedActivityDetail(),
-            syncStore.reconcileSyncStatusEffect,
-          ],
-          { concurrency: "unbounded", discard: true },
-        );
-      }),
+    onReconnectStale: ({ coordinator_connected }) => {
+      const markUnavailable = Effect.sync(() => syncStore.setProviderAvailable(false));
+      if (coordinator_connected === false) return markUnavailable;
+      // The replay ring rolled past the client's cursor while it was
+      // disconnected. Hide cached provider projections until every
+      // authoritative read succeeds because no missed event can be assumed
+      // to replay.
+      return markUnavailable.pipe(
+        Effect.andThen(reconcileProviderState()),
+        Effect.andThen(Effect.sync(() => syncStore.setProviderAvailable(true))),
+      );
+    },
   });
 
   const si: StoreInstances = {

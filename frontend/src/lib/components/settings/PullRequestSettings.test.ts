@@ -42,6 +42,17 @@ describe("PullRequestSettings", () => {
     mockPersistSettings.mockReset();
   });
 
+  it("labels coordinator-owned pull request policy", () => {
+    render(SettingsRuntimeHarness, {
+      props: {
+        component: PullRequestSettings,
+        componentProps: { pullRequests: initial, onUpdate: vi.fn(), owner: "coordinator" },
+      },
+    });
+
+    expect(screen.getByText("Pull request policy is managed by the fleet coordinator.")).toBeTruthy();
+  });
+
   it("saves the GitHub native stack preference", async () => {
     const onUpdate = vi.fn();
     const saved = { ...initial, prefer_github_native_stacks: true };

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"go.kenn.io/forge/internal/db"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/platform"
+	"go.kenn.io/forge/internal/providerplane"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/server/workspaceapi"
 )
@@ -32,12 +34,21 @@ type deferredMergeCheckKey struct {
 // must stand down silently instead of later broadcasting a misleading
 // "no longer open" failure for a pull request the maintainer just merged.
 type deferredMergeHandle struct {
-	superseded chan struct{}
-	once       sync.Once
+	superseded  chan struct{}
+	once        sync.Once
+	release     func()
+	releaseOnce sync.Once
 }
 
 func newDeferredMergeHandle() *deferredMergeHandle {
 	return &deferredMergeHandle{superseded: make(chan struct{})}
+}
+
+func (h *deferredMergeHandle) finish() {
+	if h == nil || h.release == nil {
+		return
+	}
+	h.releaseOnce.Do(h.release)
 }
 
 func (h *deferredMergeHandle) supersede() {
@@ -183,8 +194,25 @@ func (s *Handler) enqueueDeferredMerge(
 		)
 	}
 	key := deferredMergeKey(*repo, number)
-	handle, marked := s.markDeferredMergeInFlight(key)
+	var releaseDeferred func()
+	if s.providerWriteGate != nil {
+		releaseDeferred, err = s.providerWriteGate.BeginDeferredMerge(ctx)
+		if err != nil {
+			if errors.Is(err, providerplane.ErrNodePreparationInProgress) {
+				return deferMergePRBody{}, httpapi.NewProblem(
+					http.StatusConflict, httpapi.CodeNodePreparationInProgress,
+					"node preparation has sealed deferred merge admission",
+					map[string]any{"reason": "nodePreparationInProgress"},
+				)
+			}
+			return deferMergePRBody{}, httpapi.Internal("admit deferred merge: " + err.Error())
+		}
+	}
+	handle, marked := s.markDeferredMergeInFlight(key, releaseDeferred)
 	if !marked {
+		if releaseDeferred != nil {
+			releaseDeferred()
+		}
 		return deferMergePRBody{}, httpapi.Conflict(
 			httpapi.CodeConflict,
 			"a deferred merge is already waiting for this pull request",
@@ -702,7 +730,10 @@ func deferredMergeKey(repo db.Repo, number int) string {
 	return string(repoProviderKind(repo)) + ":" + repoProviderHost(repo) + ":" + repo.RepoPath + "#" + strconv.Itoa(number)
 }
 
-func (s *Handler) markDeferredMergeInFlight(key string) (*deferredMergeHandle, bool) {
+func (s *Handler) markDeferredMergeInFlight(
+	key string,
+	releases ...func(),
+) (*deferredMergeHandle, bool) {
 	s.deferredMergeMu.Lock()
 	defer s.deferredMergeMu.Unlock()
 	if s.deferredMergeInFlight == nil {
@@ -712,6 +743,9 @@ func (s *Handler) markDeferredMergeInFlight(key string) (*deferredMergeHandle, b
 		return nil, false
 	}
 	handle := newDeferredMergeHandle()
+	if len(releases) > 0 {
+		handle.release = releases[0]
+	}
 	s.deferredMergeInFlight[key] = handle
 	return handle, true
 }
@@ -732,6 +766,7 @@ func (s *Handler) clearDeferredMergeInFlight(key string, handle *deferredMergeHa
 	defer s.deferredMergeMu.Unlock()
 	if s.deferredMergeInFlight[key] == handle {
 		delete(s.deferredMergeInFlight, key)
+		handle.finish()
 	}
 }
 
@@ -748,4 +783,5 @@ func (s *Handler) supersedeDeferredMerge(key string) {
 	}
 	handle.supersede()
 	delete(s.deferredMergeInFlight, key)
+	handle.finish()
 }

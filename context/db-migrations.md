@@ -43,6 +43,23 @@ schema migrations.
   tests.
 - When changing persisted data, test with real SQLite tables and representative child rows. Include dependent records that can be lost through foreign keys, uniqueness conflicts, or `INSERT OR IGNORE`.
 
+## Federation Node Preparation
+
+Migration `000054_federated_node_preparation` is the atomic standalone-to-node
+preparation boundary. It owns versioned workspace launch specifications, the
+singleton durable quiesce/seal state, content-addressed provider-state handoff
+receipts, coordinator-issued seals, and notification acknowledgement admission
+generations.
+
+- Backfill launch specifications only when existing repository and provider-item
+  rows contain every required fact. Missing facts remain explicitly discoverable
+  through `DB.ListUnpreparedProviderWorkspaces`; never synthesize readiness.
+- Ad-hoc and Kata workspaces do not require provider launch specifications.
+- The down migration removes only migration-54 tables and triggers. It does not
+  rewrite provider, workspace, review, workflow, or notification source rows.
+- Review drafts and workflow rows remain on the source node as an audit trail
+  after handoff; the active node runtime stops reading them in the role switch.
+
 ## Migration Review Checklist
 
 - [ ] The migration runs from the previous schema version to the new version.

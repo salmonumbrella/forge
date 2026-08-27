@@ -50,6 +50,14 @@ describe("ActivitySettings", () => {
     mockPersistSettings.mockReset();
   });
 
+  it("labels coordinator-owned activity policy", () => {
+    render(ActivitySettingsTestHarness, {
+      props: { activity: initial, onUpdate: vi.fn(), owner: "coordinator" },
+    });
+
+    expect(screen.getByText("Activity policy is managed by the fleet coordinator.")).toBeTruthy();
+  });
+
   it("persists and hydrates updated activity defaults", async () => {
     const updated = { ...initial, hide_bots: true };
     const onUpdate = vi.fn();

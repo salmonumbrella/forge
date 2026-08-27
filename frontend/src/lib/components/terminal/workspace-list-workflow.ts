@@ -99,21 +99,21 @@ export function workspaceListLifecycle<WorkspaceR, FleetR, EventR>({
 > {
   const poll = (request: () => void, interval: Duration.Input) =>
     Stream.fromSchedule(Schedule.spaced(interval)).pipe(Stream.runForEach(() => Effect.sync(request)));
+  const sharedRefresh = refreshWorkspaces === (refreshFleet as unknown as WorkspaceRefreshCoordinator<WorkspaceR>);
 
   return Effect.sync(() => {
     refreshWorkspaces.request();
-    refreshFleet.request();
+    if (!sharedRefresh) refreshFleet.request();
   }).pipe(
     Effect.andThen(
       Effect.all(
         [
           refreshWorkspaces.program,
-          refreshFleet.program,
           poll(refreshWorkspaces.request, "5 seconds"),
-          poll(refreshFleet.request, "15 seconds"),
           Stream.runForEach(workspaceEvents, () =>
             Effect.sync(refreshWorkspaces.request).pipe(Effect.andThen(Effect.yieldNow)),
           ),
+          ...(sharedRefresh ? [] : [refreshFleet.program, poll(refreshFleet.request, "15 seconds")]),
         ],
         { concurrency: "unbounded", discard: true },
       ),

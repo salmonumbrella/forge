@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"go.kenn.io/forge/internal/gitclone"
 	"go.kenn.io/forge/internal/tokenauth"
 )
 
@@ -62,8 +63,16 @@ func (m *Manager) branchSyncGit(
 // marked as a mutation so it stays on the user's own PAT chain rather than a
 // GitHub App installation token.
 func (m *Manager) PushWorktreeBranch(
-	ctx context.Context, platformName, platformHost, owner, name, dir string,
+	ctx context.Context,
+	workspaceID, platformName, platformHost, owner, name, dir string,
 ) error {
+	requireCredential, err := m.validateBranchSyncLaunchSpec(ctx, workspaceID)
+	if err != nil {
+		return err
+	}
+	if requireCredential {
+		ctx = gitclone.WithRequiredCredential(ctx)
+	}
 	if err := m.verifyRepoRouteUnoccupied(
 		ctx, platformName, platformHost, owner, name,
 	); err != nil {
@@ -80,8 +89,16 @@ func (m *Manager) PushWorktreeBranch(
 // networked and runs through the host's authenticated git runner; the merge
 // itself is local against the already-fetched tracking ref.
 func (m *Manager) PullWorktreeBranch(
-	ctx context.Context, platformName, platformHost, owner, name, dir string,
+	ctx context.Context,
+	workspaceID, platformName, platformHost, owner, name, dir string,
 ) error {
+	requireCredential, err := m.validateBranchSyncLaunchSpec(ctx, workspaceID)
+	if err != nil {
+		return err
+	}
+	if requireCredential {
+		ctx = gitclone.WithRequiredCredential(ctx)
+	}
 	if err := m.verifyRepoRouteUnoccupied(
 		ctx, platformName, platformHost, owner, name,
 	); err != nil {
@@ -90,6 +107,27 @@ func (m *Manager) PullWorktreeBranch(
 	return pullWorktreeBranch(
 		ctx, m.branchSyncGit(platformName, platformHost, owner, name), dir,
 	)
+}
+
+func (m *Manager) validateBranchSyncLaunchSpec(
+	ctx context.Context, workspaceID string,
+) (bool, error) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return false, nil
+	}
+	if m == nil || m.db == nil {
+		return false, ErrWorkspaceNotFound
+	}
+	workspace, err := m.db.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		return false, fmt.Errorf("get workspace for branch synchronization: %w", err)
+	}
+	if workspace == nil {
+		return false, ErrWorkspaceNotFound
+	}
+	spec, err := m.RequireWorkspaceLaunchSpec(ctx, workspace)
+	return spec != nil && m.requireProviderCredential, err
 }
 
 func pushWorktreeBranch(ctx context.Context, run networkedBranchGit, dir string) error {

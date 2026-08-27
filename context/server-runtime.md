@@ -14,6 +14,10 @@ and the root event stream.
 - Lifecycle startup mints the API token under the authoritative data-directory
   lock; atomic serialized publication makes concurrent paths retain one
   credential (`internal/runtimelock/token.go::EnsureAuthToken`).
+- Each data directory owns one random 128-bit node ID. Startup serializes its
+  first write, rejects malformed existing identity, and validates it before a
+  daemon replacement can stop the old process (`internal/runtimelock/node_id.go::EnsureNodeID`,
+  `cmd/kenn-forge/daemon_lifecycle.go::daemonLifecycle.prepareConfigMutation`).
 - Lifecycle commands retain caller-spelled paths for initial default migration,
   then freeze canonical identity for locks, reloads, runtime records, and
   comparisons (`cmd/kenn-forge/daemon_lifecycle.go::daemonLifecycle.lockMutationConfig`).
@@ -25,7 +29,12 @@ and the root event stream.
   identity initialization is unavailable. Failures attributable to one provider
   host drop only that host while healthy hosts keep syncing; unattributable
   failures degrade to no provider sync. Dropped hosts serve cached data until a
-  later restart (`cmd/kenn-forge/provider_startup.go::buildProviderStartupOrDegraded`).
+  later restart (`cmd/kenn-forge/provider_startup.go::buildProviderControlPlaneOrDegraded`).
+- Every role gets lazy Git routing; only coordinators construct provider API,
+  accounting, sync, archive, notification, and deferred-work machinery.
+  `--disable-sync` suppresses coordinator refresh and never weakens node absence
+  (`cmd/kenn-forge/provider_startup.go::buildServeControlPlanes`,
+  `cmd/kenn-forge/main.go::run`).
 
 ## Startup Lock
 
@@ -98,7 +107,7 @@ and the root event stream.
   invalid config cannot strand an attributable daemon, while proof-unavailable state
   may report only the configured `data_dir` lock
   (`cmd/kenn-forge/daemon_lifecycle.go::daemonLifecycle.Status`).
-- Record metadata is string-valued `host`, `port`, `read_only=false`,
+- Record metadata is string-valued `node_id`, `host`, `port`, `read_only=false`,
   `require_auth`, `data_dir`, canonical `config_path`, and canonical
   `base_path`; `auth_token_path` is present only when auth is enabled, and
   `mcp_listen_addr` only when MCP is enabled. One typed owner builds and
@@ -110,6 +119,12 @@ and the root event stream.
   proof path binds the same identity to the published record and only accepts
   direct loopback requests
   (`internal/server/daemon_access.go::daemonRequestPolicy.admit`).
+- Node activation is part of startup readiness for federation, not for local
+  execution. A sealed node that cannot activate still serves local workspaces,
+  logs `action_required` or `incompatible` with a reason, and supplies that
+  reason to its local-only fleet projection. It must never construct a local
+  provider control plane as a fallback (`cmd/kenn-forge/node_startup.go`,
+  `cmd/kenn-forge/main.go`).
 
 ## Transport Trust Boundary
 
@@ -117,6 +132,23 @@ and the root event stream.
   named pipes are not lifecycle requirements. Background startup rejects
   non-loopback listeners before launching
   (`cmd/kenn-forge/start_background.go::validateBackgroundConfig`).
+- `[api.tailscale_serve]` authorizes allowlisted Tailscale users only for direct-loopback REST, SSE, and WebSocket requests with one valid identity header.
+  This mode trusts every local process and suits only trusted hosts; it never changes federation credentials
+  (`internal/server/daemon_access.go::daemonRequestPolicy.acceptsTailscaleServeUser`).
+- `fleet setup` keeps Forge on loopback with API auth; `--tailscale` owns one
+  Serve mapping, while `--origin` leaves ingress and browser auth to the operator
+  (`internal/fleetsetup/setup.go::configureCandidate`).
+- Setup services run as the selected current user and have no network-vendor or
+  shell dependency (`internal/fleetsetup/service.go`).
+- The daemon bearer and browser cookie remain full local-user credentials.
+  Federation bearers authenticate through a separate branch, attach an exact
+  node-ID principal to the request, and can dispatch only method/path pairs in
+  the closed peer-route inventory
+  (`internal/server/api_auth.go::Server.authorizeFederationRequest`,
+  `internal/federationauth/authenticator.go::Authenticator.RequiredScope`).
+- An optional `X-Kenn-Forge-Node-ID` header is diagnostic only: the bearer
+  establishes identity, and a supplied header that differs from its subject is
+  rejected (`internal/server/api_auth.go::Server.authorizeFederationRequest`).
 - Only the startup-bound bearer with exact loopback authority/peer and no
   forwarding headers bypasses proxy Host interpretation; cookies never qualify,
   and the bearer remains available when general API auth is off
@@ -146,11 +178,33 @@ and the root event stream.
 - The frontend checkpoint advances only after an event's Effect consequences succeed;
   overlapping owners must keep it monotonic, and buffer pressure reconnects from the
   last accepted ID (`frontend/src/lib/stores/provider-events-workflow.ts::providerEventsProgram`).
+- The coordinator's authenticated `/api/v1/federation/events` stream reuses the
+  same replay ring but emits only provider-owned event types. Workspace,
+  runtime, Docs, Kata, config, and node-connection events never cross that
+  boundary (`internal/server/federation_events.go::Server.streamFederationEvents`).
+- A node keeps the coordinator cursor private and republishes decoded provider
+  events through ordinary local `EventHub.Broadcast`. Remote IDs never advance
+  the browser's local replay floor; stale or undecodable remote state triggers
+  an authoritative provider refresh instead
+  (`internal/providerplane/events.go::EventClient`,
+  `internal/server/federation_events.go::Server.receiveCoordinatorEvent`).
+- A federation-only SSE comment marks the replay/live boundary. Nodes remain
+  provider-unavailable while replay drains, then reconcile authoritative state
+  before announcing the coordinator connection; replayed status cannot
+  overwrite that recovery snapshot
+  (`internal/server/federation_events.go::writeFederationReplayComplete`).
+- `sync_status`, `config.changed`, and `coordinator_connection_changed` are
+  latest-value events cached in local ID order for fresh browser subscribers
+  (`internal/server/event_hub.go::EventHub.enqueueCachedLocked`).
 
 ## Long-Lived Transport Inventory
 
 - Long-lived HTTP and WebSocket contracts derive from the Huma registrations;
   catch-all proxies declare finite streaming variants on their operation, and
   tracing consumes the same inventory (`internal/server/transport_inventory.go::NewTransportInventory`).
+- Federation SSE clears the whole-request client timeout but retains bounded
+  dialing, TLS negotiation, response headers, header bytes, origin pinning, and
+  redirect refusal. Its request context owns the response lifetime
+  (`internal/providerplane/client.go::hardenedStreamingClient`).
 - An annotated proxy stream is served only when the request explicitly accepts
   its declared media type (`internal/server/httpapi/transport.go::ValidateTransportAccept`).

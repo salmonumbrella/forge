@@ -14,6 +14,12 @@ coherence, file history, previews, or refresh behavior.
 - Clone namespaces include provider, host, and canonical repository path so
   identical owner/name routes cannot collide across providers or hosts
   (`internal/gitclone/repo_browser.go::repoBrowserCloneNamespace`).
+- A federation node resolves a coordinator repository descriptor before every
+  provider-page browser read. The descriptor supplies the verified provider
+  repository ID, current route, clone URL, default branch, route generation,
+  and observation time; the node reconciles those facts into its repository
+  catalog before selecting a clone. Descriptors never populate node-local pull
+  or issue tables (`internal/server/provider_sources.go::coordinatorProviderSource.GetRepositoryDescriptor`).
 
 ## Coherent Reads
 
@@ -47,6 +53,17 @@ coherence, file history, previews, or refresh behavior.
   general clone hot path is not coupled to the tag namespace
   (`internal/server/repobrowserapi/refresh.go::Handler.RunRefreshLoop`,
   `internal/gitclone/repo_browser.go::Manager.fetchRepoBrowserTags`).
+- Clone refresh is independent of provider sync. On a federation node it seeds
+  only catalog rows with verified stable IDs, and first-seen descriptors
+  register lazily created clones for later refresh even though the node has no
+  provider-item rows. Every node refresh stays credential-required and fails
+  closed if its exact repository route loses a Git credential
+  (`internal/server/repobrowserapi/refresh.go::Handler.SeedRefreshRepos`,
+  `internal/gitclone/repo_browser.go::RepoBrowserRepoRef.RequireCredential`).
+- Coordinator availability is part of provider-page admission: an existing
+  clone cannot serve a node browser request if the coordinator descriptor is
+  unavailable. Reads that are already scoped to a local workspace remain local
+  and do not acquire this dependency.
 - A missing clone may finish its single-flight initial fetch after the opening
   caller cancels; later callers share that bounded work rather than starting
   competing clones (`internal/gitclone/repo_browser.go::Manager.ensureRepoBrowserCloneLocal`).

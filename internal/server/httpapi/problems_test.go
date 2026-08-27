@@ -132,6 +132,13 @@ func TestCodeForStatus(t *testing.T) {
 	}
 }
 
+func TestCoordinatorUnavailableProblemIsRetryable(t *testing.T) {
+	problem := CoordinatorUnavailable("coordinator did not answer")
+	require.Equal(t, http.StatusServiceUnavailable, problem.GetStatus())
+	require.Equal(t, CodeCoordinatorUnavailable, problem.Code)
+	assert.Equal(t, true, problem.Details["retryable"])
+}
+
 func TestProblemHelpersSetStatusCodeAndDetails(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)

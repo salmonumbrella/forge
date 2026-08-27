@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	cryptorand "crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +16,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -28,6 +31,8 @@ import (
 	gh "github.com/google/go-github/v89/github"
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/forge/internal/federation"
+	"go.kenn.io/forge/internal/federationauth"
 	"go.kenn.io/forge/internal/gitclone"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/platform"
@@ -56,6 +61,13 @@ const defaultRoborevEndpoint = "http://127.0.0.1:1"
 
 const e2eTmuxDirEnv = "PLAYWRIGHT_E2E_TMUX_DIR"
 
+const (
+	e2eStandaloneNodeID  = "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0"
+	e2eCoordinatorNodeID = "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"
+	e2eNodeANodeID       = "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2"
+	e2eNodeBNodeID       = "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3"
+)
+
 func main() {
 	port := flag.Int("port", 0, "port to listen on (0 selects a random free port)")
 	roborev := flag.String(
@@ -66,9 +78,9 @@ func main() {
 		"default-platform-host", "github.com",
 		"default platform host for seeded config",
 	)
-	fleetKey := flag.String(
-		"fleet-key", "",
-		"fleet self key for seeded config",
+	federatedForges := flag.Bool(
+		"federated-forges", false,
+		"serve an isolated coordinator and two federation nodes",
 	)
 	visibleImportedModes := flag.Bool(
 		"visible-imported-modes", false,
@@ -92,28 +104,48 @@ func main() {
 	)
 	defer stop()
 
-	if err := run(
-		ctx,
-		*port,
-		*roborev,
-		*serverInfoFile,
-		*defaultPlatformHost,
-		*fleetKey,
-		*visibleImportedModes,
-		*providerCollision,
-	); err != nil {
+	var err error
+	if *federatedForges {
+		err = runFederatedForgesE2E(ctx, *roborev, *serverInfoFile)
+	} else {
+		err = run(
+			ctx,
+			*port,
+			*roborev,
+			*serverInfoFile,
+			*defaultPlatformHost,
+			*visibleImportedModes,
+			*providerCollision,
+		)
+	}
+	if err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
 }
 
 type e2eServerInfo struct {
-	Host       string `json:"host"`
-	Port       int    `json:"port"`
-	BaseURL    string `json:"base_url"`
-	PID        int    `json:"pid"`
-	ConfigPath string `json:"config_path"`
-	PprofAddr  string `json:"pprof_addr,omitempty"`
+	Host       string             `json:"host"`
+	Port       int                `json:"port"`
+	BaseURL    string             `json:"base_url"`
+	PID        int                `json:"pid"`
+	ConfigPath string             `json:"config_path"`
+	PprofAddr  string             `json:"pprof_addr,omitempty"`
+	NodeID     string             `json:"node_id"`
+	Federation *e2eFederationInfo `json:"federation,omitempty"`
+}
+
+type e2eFederationInfo struct {
+	CoordinatorURL    string `json:"coordinator_url"`
+	NodeAURL          string `json:"node_a_url"`
+	NodeBURL          string `json:"node_b_url"`
+	ControlURL        string `json:"control_url"`
+	CoordinatorToken  string `json:"coordinator_token"`
+	NodeAToken        string `json:"node_a_token"`
+	NodeBToken        string `json:"node_b_token"`
+	CoordinatorNodeID string `json:"coordinator_node_id"`
+	NodeANodeID       string `json:"node_a_node_id"`
+	NodeBNodeID       string `json:"node_b_node_id"`
 }
 
 type staticTokenSource string
@@ -837,10 +869,21 @@ func setPR1CIState(
 type appOptions struct {
 	roborevEndpoint      string
 	defaultPlatformHost  string
-	fleetKey             string
 	visibleImportedModes bool
 	providerCollision    bool
 	preferPtyOwner       bool
+	nodeID               string
+	federation           *e2eFederationRuntime
+}
+
+type e2eFederationRuntime struct {
+	fleet       config.Fleet
+	credentials *federationauth.Store
+	httpClient  *http.Client
+	activeNode  bool
+	localToken  string
+	workspaceID string
+	itemNumber  int
 }
 
 // appState bundles everything one logical e2e server instance owns:
@@ -1105,6 +1148,44 @@ func (st *appState) close() {
 	}
 }
 
+func seedFederatedE2EWorkspace(
+	ctx context.Context,
+	database *db.DB,
+	tmpDir, workspaceID string,
+	itemNumber int,
+) error {
+	repo, err := database.GetRepoByIdentity(
+		ctx, db.GitHubRepoIdentity("github.com", "acme", "widgets"),
+	)
+	if err != nil {
+		return fmt.Errorf("read federated fixture repository: %w", err)
+	}
+	if repo == nil {
+		return errors.New("federated fixture repository is missing")
+	}
+	pull, err := database.GetMergeRequestByRepoIDAndNumber(
+		ctx, repo.ID, itemNumber,
+	)
+	if err != nil {
+		return fmt.Errorf("read federated fixture pull: %w", err)
+	}
+	if pull == nil {
+		return fmt.Errorf("federated fixture pull %d is missing", itemNumber)
+	}
+	worktreePath := filepath.Join(tmpDir, "federated-workspaces", workspaceID)
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		return fmt.Errorf("create federated fixture workspace: %w", err)
+	}
+	return database.InsertWorkspace(ctx, &db.Workspace{
+		ID: workspaceID, Platform: "github", PlatformHost: "github.com",
+		RepoOwner: "acme", RepoName: "widgets",
+		ItemType: db.WorkspaceItemTypePullRequest, ItemNumber: itemNumber,
+		ItemKey: strconv.Itoa(itemNumber), GitHeadRef: pull.HeadBranch,
+		WorkspaceBranch: pull.HeadBranch, WorktreePath: worktreePath,
+		Status: "ready", CreatedAt: time.Now().UTC(),
+	})
+}
+
 // buildAppState seeds a complete e2e server state: fixture DB, git
 // repos, config file, provider registry, and the HTTP handler with
 // the /__e2e fixture endpoints. It runs at startup and on every
@@ -1144,6 +1225,14 @@ func buildAppState(
 	result, err := testutil.SeedFixtures(ctx, database)
 	if err != nil {
 		return nil, fmt.Errorf("seed fixtures: %w", err)
+	}
+	if opts.federation != nil && opts.federation.workspaceID != "" {
+		if err := seedFederatedE2EWorkspace(
+			ctx, database, tmpDir,
+			opts.federation.workspaceID, opts.federation.itemNumber,
+		); err != nil {
+			return nil, err
+		}
 	}
 	gitLabCloneURL, err := createBareRepoFixture(
 		ctx,
@@ -1243,7 +1332,10 @@ func buildAppState(
 		// tests run unserialized.
 		Tmux: config.Tmux{Command: guardedTmuxCommand},
 	}
-	cfg.Fleet.Key = strings.TrimSpace(opts.fleetKey)
+	if opts.federation != nil {
+		cfg.Fleet = opts.federation.fleet
+		cfg.API.RequireAuth = true
+	}
 	if opts.visibleImportedModes {
 		modes := config.DefaultModeVisibility()
 		*modes.Docs = true
@@ -1642,14 +1734,29 @@ func buildAppState(
 	syncer.SetWatchInterval(cfg.ActivePRRefreshDuration())
 	syncer.SetActiveMRWindow(cfg.ActivePRWindowDuration())
 
+	serverSyncer := syncer
+	serverOptions := server.ServerOptions{
+		Clones:                        diffRepo.Manager,
+		WorktreeDir:                   e2eWorktreeDir,
+		HostCheckAllowLoopbackAnyPort: true,
+		PtyOwnerInProcess:             opts.preferPtyOwner,
+		FederationNodeID:              opts.nodeID,
+	}
+	if opts.federation != nil {
+		serverOptions.DaemonAccess = server.DaemonAccessOptions{
+			Token: opts.federation.localToken, RequireAPIAuth: true,
+		}
+		serverOptions.FederationCredentials = opts.federation.credentials
+		serverOptions.FederationHTTPClient = opts.federation.httpClient
+		serverOptions.FederationNodeActive = opts.federation.activeNode
+		serverOptions.DisableWorkspaceBackgroundMonitors = true
+		if opts.federation.fleet.RoleOrDefault() == config.FleetRoleNode {
+			serverSyncer = nil
+		}
+	}
 	srv := server.NewWithConfig(
-		database, syncer, diffRepo.Manager, assets, cfg, cfgPath,
-		server.ServerOptions{
-			Clones:                        diffRepo.Manager,
-			WorktreeDir:                   e2eWorktreeDir,
-			HostCheckAllowLoopbackAnyPort: true,
-			PtyOwnerInProcess:             opts.preferPtyOwner,
-		},
+		database, serverSyncer, diffRepo.Manager, assets, cfg, cfgPath,
+		serverOptions,
 	)
 	// Mirror production wiring so notification syncs nudge an open activity
 	// feed to reload (the feed's incremental poll skips backfilled rows).
@@ -1661,7 +1768,15 @@ func buildAppState(
 	})
 	var failNextRepoBrowserTree atomic.Bool
 	var failNextNotificationRead atomic.Bool
+	forkGitRoot := filepath.Join(tmpDir, "forks")
+	forkGitHandler := http.FileServer(http.Dir(forkGitRoot))
 	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+			strings.EqualFold(r.Host, "github.com") &&
+			strings.HasPrefix(r.URL.Path, "/forker/widgets.git/") {
+			forkGitHandler.ServeHTTP(w, r)
+			return
+		}
 		if r.Method == http.MethodPost &&
 			r.URL.Path == "/__e2e/issue-workspace/reused-branch" {
 			identityClonePath, err := diffRepo.Manager.ClonePathForContext(
@@ -1711,7 +1826,6 @@ func buildAppState(
 				return
 			}
 			forkSnapshot := *mr
-			forkSnapshot.HeadRepoCloneURL = "https://github.com/forker/widgets.git"
 			forkSnapshot.UpdatedAt = time.Now().UTC()
 			clonePath, err := diffRepo.Manager.ClonePathForContext(
 				gitclone.WithRepositoryIdentity(r.Context(), diffRepo.PlatformRepoID),
@@ -1730,18 +1844,36 @@ func buildAppState(
 				return
 			}
 			originPath := strings.TrimSpace(string(originOutput))
-			_, stderr, err := gitcmd.New().Run(
-				r.Context(), originPath, nil,
-				"update-ref", "refs/pull/1/head", diffRepo.HeadSHA,
-			)
-			if err != nil {
+			forkPath := filepath.Join(forkGitRoot, "forker", "widgets.git")
+			if err := os.MkdirAll(filepath.Dir(forkPath), 0o755); err != nil {
+				http.Error(w, "create fixture fork parent", http.StatusInternalServerError)
+				return
+			}
+			if err := e2eGit(
+				r.Context(), "", "clone", "--bare", originPath, forkPath,
+			); err != nil {
 				http.Error(
 					w,
-					"create fixture pull ref: "+string(stderr),
+					"create fixture fork: "+err.Error(),
 					http.StatusInternalServerError,
 				)
 				return
 			}
+			if err := e2eGit(r.Context(), forkPath, "update-server-info"); err != nil {
+				http.Error(w, "prepare fixture fork: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			proxyURL := "http://" + r.Host
+			for key, value := range map[string]string{
+				"HTTP_PROXY": proxyURL, "http_proxy": proxyURL,
+				"NO_PROXY": "127.0.0.1,localhost,::1", "no_proxy": "127.0.0.1,localhost,::1",
+			} {
+				if err := os.Setenv(key, value); err != nil {
+					http.Error(w, "configure fixture git proxy", http.StatusInternalServerError)
+					return
+				}
+			}
+			forkSnapshot.HeadRepoCloneURL = "http://github.com/forker/widgets.git"
 			_, accepted, err := database.UpsertMergeRequestSnapshot(
 				r.Context(), &forkSnapshot,
 			)
@@ -2861,13 +2993,270 @@ func buildAppState(
 	}, nil
 }
 
+type e2eFederationHandlerBox struct {
+	handler http.Handler
+}
+
+type e2eFederationSwitch struct {
+	current atomic.Pointer[e2eFederationHandlerBox]
+	offline atomic.Bool
+}
+
+func newE2EFederationSwitch() *e2eFederationSwitch {
+	switcher := &e2eFederationSwitch{}
+	switcher.Set(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "federated e2e daemon is starting", http.StatusServiceUnavailable)
+	}))
+	return switcher
+}
+
+func (s *e2eFederationSwitch) Set(handler http.Handler) {
+	s.current.Store(&e2eFederationHandlerBox{handler: handler})
+}
+
+func (s *e2eFederationSwitch) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.offline.Load() {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": http.StatusServiceUnavailable,
+			"code":   "coordinatorUnavailable",
+			"detail": "the federated e2e coordinator is offline",
+		})
+		return
+	}
+	s.current.Load().handler.ServeHTTP(w, r)
+}
+
+func writeFederatedE2EControlResponse(w http.ResponseWriter, status string) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": status})
+}
+
+func runFederatedForgesE2E(
+	ctx context.Context,
+	roborevEndpoint, serverInfoFile string,
+) error {
+	assets, err := web.Assets()
+	if err != nil {
+		return fmt.Errorf("load frontend assets: %w", err)
+	}
+
+	coordinatorSwitch := newE2EFederationSwitch()
+	nodeASwitch := newE2EFederationSwitch()
+	nodeBSwitch := newE2EFederationSwitch()
+	coordinatorHTTP := httptest.NewUnstartedServer(coordinatorSwitch)
+	nodeAHTTP := httptest.NewUnstartedServer(nodeASwitch)
+	nodeBHTTP := httptest.NewUnstartedServer(nodeBSwitch)
+	for _, origin := range []*httptest.Server{coordinatorHTTP, nodeAHTTP, nodeBHTTP} {
+		origin.StartTLS()
+		defer origin.Close()
+	}
+	controlHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		switch r.URL.Path {
+		case "/coordinator/offline":
+			coordinatorSwitch.offline.Store(true)
+			coordinatorHTTP.CloseClientConnections()
+			writeFederatedE2EControlResponse(w, "offline")
+		case "/coordinator/online":
+			coordinatorSwitch.offline.Store(false)
+			writeFederatedE2EControlResponse(w, "online")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer controlHTTP.Close()
+
+	federationClient := e2eFederationHTTPClient(
+		coordinatorHTTP, nodeAHTTP, nodeBHTTP,
+	)
+	if transport, ok := federationClient.Transport.(*http.Transport); ok {
+		defer transport.CloseIdleConnections()
+	}
+	credentialDir, err := os.MkdirTemp("", "kenn-forge-e2e-federation-credentials-*")
+	if err != nil {
+		return fmt.Errorf("create federation credential directory: %w", err)
+	}
+	defer os.RemoveAll(credentialDir)
+	coordinatorCredentials, err := federationauth.Open(
+		filepath.Join(credentialDir, "coordinator.json"),
+	)
+	if err != nil {
+		return err
+	}
+	nodeACredentials, err := federationauth.Open(
+		filepath.Join(credentialDir, "node-a.json"),
+	)
+	if err != nil {
+		return err
+	}
+	nodeBCredentials, err := federationauth.Open(
+		filepath.Join(credentialDir, "node-b.json"),
+	)
+	if err != nil {
+		return err
+	}
+	if err := connectE2EFederationCredentials(
+		coordinatorCredentials, nodeACredentials,
+		e2eCoordinatorNodeID, e2eNodeANodeID,
+	); err != nil {
+		return err
+	}
+	if err := connectE2EFederationCredentials(
+		coordinatorCredentials, nodeBCredentials,
+		e2eCoordinatorNodeID, e2eNodeBNodeID,
+	); err != nil {
+		return err
+	}
+
+	const (
+		coordinatorToken = "federated-e2e-coordinator-local-token"
+		nodeAToken       = "federated-e2e-node-a-local-token"
+		nodeBToken       = "federated-e2e-node-b-local-token"
+	)
+	coordinatorState, err := buildAppState(ctx, assets, appOptions{
+		roborevEndpoint: roborevEndpoint, defaultPlatformHost: "github.com",
+		nodeID: e2eCoordinatorNodeID,
+		federation: &e2eFederationRuntime{
+			fleet: config.Fleet{
+				Enabled: true, Role: config.FleetRoleCoordinator,
+				BaseURL: coordinatorHTTP.URL, PeerTimeout: "1s",
+				Members: []config.FleetMember{
+					{NodeID: e2eNodeANodeID, Name: "Node A", BaseURL: nodeAHTTP.URL, State: federation.EnrollmentActive},
+					{NodeID: e2eNodeBNodeID, Name: "Node B", BaseURL: nodeBHTTP.URL, State: federation.EnrollmentActive},
+				},
+			},
+			credentials: coordinatorCredentials, httpClient: federationClient,
+			localToken: coordinatorToken,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	defer coordinatorState.close()
+	coordinatorSwitch.Set(coordinatorState.handler)
+
+	nodeState := func(
+		nodeID, baseURL, workspaceID, token string,
+		credentials *federationauth.Store,
+		itemNumber int,
+	) (*appState, error) {
+		return buildAppState(ctx, assets, appOptions{
+			roborevEndpoint: roborevEndpoint, defaultPlatformHost: "github.com",
+			nodeID: nodeID,
+			federation: &e2eFederationRuntime{
+				fleet: config.Fleet{
+					Enabled: true, Role: config.FleetRoleNode,
+					BaseURL: baseURL, PeerTimeout: "1s",
+					Coordinator: &config.FleetCoordinator{
+						NodeID: e2eCoordinatorNodeID, Name: "Coordinator",
+						BaseURL: coordinatorHTTP.URL,
+					},
+				},
+				credentials: credentials, httpClient: federationClient,
+				activeNode: true, localToken: token,
+				workspaceID: workspaceID, itemNumber: itemNumber,
+			},
+		})
+	}
+	nodeAState, err := nodeState(
+		e2eNodeANodeID, nodeAHTTP.URL, "federated-node-a-workspace",
+		nodeAToken, nodeACredentials, 1,
+	)
+	if err != nil {
+		return err
+	}
+	defer nodeAState.close()
+	nodeASwitch.Set(nodeAState.handler)
+	nodeBState, err := nodeState(
+		e2eNodeBNodeID, nodeBHTTP.URL, "federated-node-b-workspace",
+		nodeBToken, nodeBCredentials, 2,
+	)
+	if err != nil {
+		return err
+	}
+	defer nodeBState.close()
+	nodeBSwitch.Set(nodeBState.handler)
+
+	coordinatorAddress, ok := coordinatorHTTP.Listener.Addr().(*net.TCPAddr)
+	if !ok {
+		return fmt.Errorf("unexpected federation listener address %T", coordinatorHTTP.Listener.Addr())
+	}
+	info := e2eServerInfo{
+		Host: "127.0.0.1", Port: coordinatorAddress.Port,
+		BaseURL: coordinatorHTTP.URL, PID: os.Getpid(),
+		ConfigPath: coordinatorState.cfgPath, NodeID: e2eCoordinatorNodeID,
+		Federation: &e2eFederationInfo{
+			CoordinatorURL: coordinatorHTTP.URL,
+			NodeAURL:       nodeAHTTP.URL, NodeBURL: nodeBHTTP.URL,
+			ControlURL:       controlHTTP.URL,
+			CoordinatorToken: coordinatorToken,
+			NodeAToken:       nodeAToken, NodeBToken: nodeBToken,
+			CoordinatorNodeID: e2eCoordinatorNodeID,
+			NodeANodeID:       e2eNodeANodeID, NodeBNodeID: e2eNodeBNodeID,
+		},
+	}
+	if err := writeServerInfoFile(serverInfoFile, info); err != nil {
+		return fmt.Errorf("write server info file: %w", err)
+	}
+	defer cleanupServerInfoFile(serverInfoFile)
+	slog.Info("starting federated e2e servers",
+		"coordinator", coordinatorHTTP.URL,
+		"node_a", nodeAHTTP.URL, "node_b", nodeBHTTP.URL,
+	)
+	<-ctx.Done()
+	return nil
+}
+
+func e2eFederationHTTPClient(origins ...*httptest.Server) *http.Client {
+	roots := x509.NewCertPool()
+	for _, origin := range origins {
+		roots.AddCert(origin.Certificate())
+	}
+	return &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
+		RootCAs: roots, MinVersion: tls.VersionTLS12,
+	}}, Timeout: 15 * time.Second}
+}
+
+func connectE2EFederationCredentials(
+	coordinator, node *federationauth.Store,
+	coordinatorNodeID, nodeID string,
+) error {
+	nodeToCoordinator, err := coordinator.MintInbound(
+		nodeID, federationauth.NodeToCoordinatorScopes(),
+	)
+	if err != nil {
+		return err
+	}
+	if err := node.StoreOutbound(
+		coordinatorNodeID, nodeToCoordinator,
+		federationauth.NodeToCoordinatorScopes(),
+	); err != nil {
+		return err
+	}
+	coordinatorToNode, err := node.MintInbound(
+		coordinatorNodeID, federationauth.CoordinatorToNodeScopes(),
+	)
+	if err != nil {
+		return err
+	}
+	return coordinator.StoreOutbound(
+		nodeID, coordinatorToNode,
+		federationauth.CoordinatorToNodeScopes(),
+	)
+}
+
 // run starts the e2e server and blocks until ctx is canceled or the
 // HTTP server errors out. Tests call it directly with a cancellable
 // context; main() wires it to SIGINT/SIGTERM.
 func run(
 	ctx context.Context,
 	port int,
-	roborevEndpoint, serverInfoFile, defaultPlatformHost, fleetKey string,
+	roborevEndpoint, serverInfoFile, defaultPlatformHost string,
 	visibleImportedModes bool,
 	providerCollision bool,
 ) error {
@@ -2879,9 +3268,9 @@ func run(
 	baseOpts := appOptions{
 		roborevEndpoint:      roborevEndpoint,
 		defaultPlatformHost:  defaultPlatformHost,
-		fleetKey:             fleetKey,
 		visibleImportedModes: visibleImportedModes,
 		providerCollision:    providerCollision,
+		nodeID:               e2eStandaloneNodeID,
 	}
 
 	state, err := buildAppState(ctx, assets, baseOpts)
@@ -2915,6 +3304,7 @@ func run(
 		BaseURL:    fmt.Sprintf("http://127.0.0.1:%d", tcpAddr.Port),
 		PID:        os.Getpid(),
 		ConfigPath: state.cfgPath,
+		NodeID:     e2eStandaloneNodeID,
 	}
 
 	// OTel export is opt-in via OTEL_TRACES_EXPORTER; a malformed value
@@ -2980,11 +3370,10 @@ func run(
 
 			opts := baseOpts
 			var req struct {
-				DefaultPlatformHost  string  `json:"default_platform_host"`
-				FleetKey             *string `json:"fleet_key"`
-				VisibleImportedModes *bool   `json:"visible_imported_modes"`
-				ProviderCollision    *bool   `json:"provider_collision"`
-				PreferPtyOwner       *bool   `json:"prefer_pty_owner"`
+				DefaultPlatformHost  string `json:"default_platform_host"`
+				VisibleImportedModes *bool  `json:"visible_imported_modes"`
+				ProviderCollision    *bool  `json:"provider_collision"`
+				PreferPtyOwner       *bool  `json:"prefer_pty_owner"`
 			}
 			// An empty body resets to the startup options; a
 			// non-empty body must be valid JSON so option typos
@@ -3006,9 +3395,6 @@ func run(
 			}
 			if strings.TrimSpace(req.DefaultPlatformHost) != "" {
 				opts.defaultPlatformHost = req.DefaultPlatformHost
-			}
-			if req.FleetKey != nil {
-				opts.fleetKey = strings.TrimSpace(*req.FleetKey)
 			}
 			if req.VisibleImportedModes != nil {
 				opts.visibleImportedModes = *req.VisibleImportedModes
@@ -3137,7 +3523,9 @@ func writeServerInfoFile(path string, info e2eServerInfo) error {
 	}
 
 	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, append(content, '\n'), 0o644); err != nil {
+	// Federation-mode server info contains local API bearers for its three
+	// isolated daemons. Keep the file private even in a caller-supplied directory.
+	if err := os.WriteFile(tmpPath, append(content, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write temp server info file: %w", err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {

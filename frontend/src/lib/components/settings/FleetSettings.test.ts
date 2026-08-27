@@ -1,9 +1,8 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { Effect, Layer } from "effect";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import * as flash from "../../stores/flash.svelte.js";
-
 import type { FleetSettings as FleetSettingsType } from "../../api/types.js";
+import * as flash from "../../stores/flash.svelte.js";
 
 const { mockUpdateFleetSettings } = vi.hoisted(() => ({
   mockUpdateFleetSettings: vi.fn(),
@@ -34,24 +33,11 @@ afterEach(() => {
 function fleetSettings(overrides: Partial<FleetSettingsType> = {}): FleetSettingsType {
   return {
     enabled: false,
-    key: "studio",
+    role: "coordinator",
+    members: [],
+    enrollments: [],
     peer_timeout: "2s",
     sessions: { include_unmanaged_details: false },
-    peers: [
-      {
-        key: "mini",
-        name: "Mac mini",
-        base_url: "http://mini.tail:8091",
-      },
-    ],
-    ssh_peers: [
-      {
-        key: "epyc",
-        name: "EPYC",
-        destination: "wes@epyc.tail",
-        platform: "linux",
-      },
-    ],
     restart_required: false,
     ...overrides,
   };
@@ -69,116 +55,105 @@ describe("FleetSettings", () => {
     mockUpdateFleetSettings.mockReset();
   });
 
-  it("shows disabled federation while keeping saved membership editable", () => {
-    renderFleetSettings(fleetSettings());
-
-    const toggle = screen.getByRole("checkbox", {
-      name: "Enable fleet federation",
-    }) as HTMLInputElement;
-    expect(toggle.checked).toBe(false);
-    expect(screen.getByText("Remote hosts stay unavailable while federation is off.")).toBeTruthy();
-    expect(screen.getByRole("table", { name: "HTTP peer membership" })).toBeTruthy();
-    expect(screen.getByRole("table", { name: "SSH peer membership" })).toBeTruthy();
-    expect(screen.getByLabelText("HTTP peer mini key")).toBeTruthy();
-    expect(screen.getByLabelText("HTTP peer mini base URL")).toBeTruthy();
-    expect(screen.getByLabelText("SSH peer epyc key")).toBeTruthy();
-    expect(screen.getByLabelText("SSH peer epyc destination")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "SSH peer epyc platform: linux" })).toBeTruthy();
-  });
-
-  it("saves edited federation settings", async () => {
-    const onUpdate = vi.fn();
-    const saved = fleetSettings({
-      enabled: true,
-      key: "hub",
-      peer_timeout: "4s",
-      restart_required: true,
-    });
-    mockUpdateFleetSettings.mockReturnValue(Effect.succeed(saved));
-
-    renderFleetSettings(fleetSettings(), onUpdate);
-
-    await fireEvent.click(screen.getByRole("checkbox", { name: "Enable fleet federation" }));
-    await fireEvent.input(screen.getByLabelText("Local fleet key"), {
-      target: { value: "hub" },
-    });
-    await fireEvent.input(screen.getByLabelText("Peer timeout"), {
-      target: { value: "4s" },
-    });
-    await fireEvent.input(screen.getByLabelText("HTTP peer mini name"), {
-      target: { value: "Mini" },
-    });
-    await fireEvent.input(screen.getByLabelText("SSH peer epyc remote command"), {
-      target: { value: "kenn-forge" },
-    });
-    await fireEvent.click(screen.getByRole("button", { name: "SSH peer epyc platform: linux" }));
-    const platformInput = screen.getByRole("combobox", { name: "SSH peer epyc platform" });
-    await fireEvent.input(platformInput, { target: { value: "mac" } });
-    await fireEvent.keyDown(platformInput, { key: "ArrowUp" });
-    await fireEvent.keyDown(platformInput, { key: "Enter" });
-    await fireEvent.click(screen.getByRole("button", { name: "Save fleet federation" }));
-
-    await waitFor(() => {
-      expect(mockUpdateFleetSettings).toHaveBeenCalledWith({
-        enabled: true,
-        key: "hub",
-        peer_timeout: "4s",
-        sessions: { include_unmanaged_details: false },
-        peers: [
-          {
-            key: "mini",
-            name: "Mini",
-            base_url: "http://mini.tail:8091",
-          },
-        ],
-        ssh_peers: [
-          {
-            key: "epyc",
-            name: "EPYC",
-            destination: "wes@epyc.tail",
-            platform: "macos",
-            remote_command: "kenn-forge",
-          },
-        ],
-      });
-    });
-    expect(onUpdate).toHaveBeenCalledWith(saved);
-    expect(screen.getByText("Restart required")).toBeTruthy();
-  });
-
-  it("keeps SSH platform custom values editable", async () => {
-    mockUpdateFleetSettings.mockReturnValue(Effect.succeed(fleetSettings()));
-
+  it("shows coordinator membership and enrollment state", () => {
     renderFleetSettings(
       fleetSettings({
-        ssh_peers: [
+        enabled: true,
+        members: [
           {
-            key: "epyc",
-            name: "EPYC",
-            destination: "wes@epyc.tail",
-            platform: "plan9",
+            node_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            name: "Build node",
+            base_url: "https://build.example",
+            state: "active",
+          },
+        ],
+        enrollments: [
+          {
+            id: "11111111111111111111111111111111",
+            coordinator_base_url: "https://coordinator.example",
+            coordinator_node_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            created_at: "2026-08-22T10:00:00Z",
+            expires_at: "2026-08-22T11:00:00Z",
+            node_base_url: "https://new-node.example",
+            node_id: "cccccccccccccccccccccccccccccccc",
+            node_name: "New node",
+            node_platform: "linux",
+            protocol_version: 3,
+            state: "pending",
+            updated_at: "2026-08-22T10:00:00Z",
           },
         ],
       }),
     );
 
-    await fireEvent.click(screen.getByRole("button", { name: "SSH peer epyc platform: plan9" }));
-    const platformInput = screen.getByRole("combobox", { name: "SSH peer epyc platform" });
-    await fireEvent.input(platformInput, { target: { value: "freebsd" } });
-    await fireEvent.keyDown(platformInput, { key: "Enter" });
+    expect(screen.getByText("Federation coordinator")).toBeTruthy();
+    expect(screen.getByRole("table", { name: "Federation member status" })).toBeTruthy();
+    expect(screen.getByText("Build node")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "https://build.example" }).getAttribute("href")).toBe(
+      "https://build.example",
+    );
+    expect(screen.getByRole("region", { name: "Enrollment activity" })).toBeTruthy();
+    expect(screen.getByText("New node")).toBeTruthy();
+  });
+
+  it("shows a node's coordinator binding", () => {
+    renderFleetSettings(
+      fleetSettings({
+        enabled: true,
+        role: "node",
+        coordinator: {
+          node_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          name: "Studio",
+          base_url: "https://studio.example",
+        },
+      }),
+    );
+
+    expect(screen.getByText("Execution node")).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Coordinator binding" })).toBeTruthy();
+    expect(screen.getByText("Studio")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "https://studio.example" }).getAttribute("href")).toBe(
+      "https://studio.example",
+    );
+    expect(screen.queryByRole("table", { name: "Federation member status" })).toBeNull();
+  });
+
+  it("saves runtime settings without rewriting enrollment-owned membership", async () => {
+    const onUpdate = vi.fn();
+    const initial = fleetSettings({
+      members: [
+        {
+          node_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          name: "Build node",
+          base_url: "https://build.example",
+          state: "active",
+        },
+      ],
+    });
+    const saved = fleetSettings({
+      ...initial,
+      enabled: true,
+      peer_timeout: "4s",
+      restart_required: true,
+    });
+    mockUpdateFleetSettings.mockReturnValue(Effect.succeed(saved));
+    renderFleetSettings(initial, onUpdate);
+
+    await fireEvent.click(screen.getByRole("checkbox", { name: "Enable fleet federation" }));
+    await fireEvent.input(screen.getByLabelText("Member request timeout"), {
+      target: { value: "4s" },
+    });
     await fireEvent.click(screen.getByRole("button", { name: "Save fleet federation" }));
 
     await waitFor(() => {
-      expect(mockUpdateFleetSettings).toHaveBeenCalledWith(
-        expect.objectContaining({
-          ssh_peers: [
-            expect.objectContaining({
-              platform: "freebsd",
-            }),
-          ],
-        }),
-      );
+      expect(mockUpdateFleetSettings).toHaveBeenCalledWith({
+        enabled: true,
+        peer_timeout: "4s",
+        sessions: { include_unmanaged_details: false },
+      });
     });
+    expect(onUpdate).toHaveBeenCalledWith(saved);
+    expect(screen.getByText("Restart required")).toBeTruthy();
   });
 
   it("surfaces save errors without discarding the draft", async () => {
@@ -186,24 +161,25 @@ describe("FleetSettings", () => {
       Effect.fail({
         _tag: "ApiProblemError",
         operation: "save fleet settings",
-        problem: { type: "about:blank", detail: "fleet.peers[0]: base_url is required" },
+        problem: {
+          type: "about:blank",
+          detail: "fleet.peer_timeout must be a positive duration",
+        },
       }),
     );
-
     renderFleetSettings(fleetSettings());
 
-    await fireEvent.input(screen.getByLabelText("HTTP peer mini name"), {
-      target: { value: "Mini" },
+    await fireEvent.input(screen.getByLabelText("Member request timeout"), {
+      target: { value: "invalid" },
     });
     await fireEvent.click(screen.getByRole("button", { name: "Save fleet federation" }));
 
     await waitFor(() =>
       expect(flash.getFlash()).toMatchObject({
-        message: "fleet.peers[0]: base_url is required",
+        message: "fleet.peer_timeout must be a positive duration",
         tone: "danger",
       }),
     );
-    expect(screen.queryByText("fleet.peers[0]: base_url is required")).toBeNull();
-    expect((screen.getByLabelText("HTTP peer mini name") as HTMLInputElement).value).toBe("Mini");
+    expect((screen.getByLabelText("Member request timeout") as HTMLInputElement).value).toBe("invalid");
   });
 });

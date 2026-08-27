@@ -76,8 +76,14 @@ type startupConfigSnapshot struct {
 	Tmux            config.Tmux
 	Shell           config.Shell
 	FleetSessions   config.FleetSessions
+	FleetRole       config.FleetRole
+	Coordinator     *fleetCoordinatorStartupBinding
 	RequireAuth     bool
-	SSHPeers        []config.FleetSSHPeer
+}
+
+type fleetCoordinatorStartupBinding struct {
+	NodeID  string
+	BaseURL string
 }
 
 func snapshotStartupConfig(cfg *config.Config) startupConfigSnapshot {
@@ -110,11 +116,17 @@ func snapshotStartupConfig(cfg *config.Config) startupConfigSnapshot {
 	}
 	snap.Shell.Command = slices.Clone(cfg.Shell.Command)
 	snap.TokenEnvNames = startupBoundTokenEnvNames(cfg)
-	// API auth, fleet session monitoring, and the ssh peer set are
+	// API auth, fleet role, coordinator binding, and session monitoring are
 	// wired in newServer, so edits require a restart.
 	snap.FleetSessions = cfg.Fleet.Sessions
+	snap.FleetRole = cfg.Fleet.RoleOrDefault()
+	if cfg.Fleet.Coordinator != nil {
+		snap.Coordinator = &fleetCoordinatorStartupBinding{
+			NodeID:  cfg.Fleet.Coordinator.NodeID,
+			BaseURL: cfg.Fleet.Coordinator.BaseURL,
+		}
+	}
 	snap.RequireAuth = cfg.API.RequireAuth
-	snap.SSHPeers = slices.Clone(cfg.Fleet.SSHPeers)
 	return snap
 }
 
@@ -692,8 +704,11 @@ func cloneReloadedConfig(in *config.Config) config.Config {
 		out.Tmux.AgentSessions = &v
 	}
 	out.Shell.Command = slices.Clone(in.Shell.Command)
-	out.Fleet.Peers = slices.Clone(in.Fleet.Peers)
-	out.Fleet.SSHPeers = slices.Clone(in.Fleet.SSHPeers)
+	out.Fleet.Members = slices.Clone(in.Fleet.Members)
+	if in.Fleet.Coordinator != nil {
+		coordinator := *in.Fleet.Coordinator
+		out.Fleet.Coordinator = &coordinator
+	}
 	return out
 }
 

@@ -35,6 +35,10 @@ Think about mobile work in this order:
 ## Design rules
 
 - Build dedicated phone routes/components when the desktop interaction model does not fit. A `/m` route must not simply mount the desktop view inside a narrow wrapper.
+- The phone top bar may expose the same direct Forge selector as desktop. Keep
+  it within the phone viewport, retain the product name when only one Forge is
+  available, and navigate with ordinary origin links so other tabs are not
+  retargeted (`frontend/src/lib/components/layout/ForgeSelector.svelte`).
 - Preserve human-facing product copy. Remove text that sounds like an implementation note or model instruction.
 - Keep repository/provider identity visible enough to disambiguate similarly named repos, especially on activity cards and detail headers.
 - Give focused PR/issue detail pages their own phone shell treatment even when they reuse desktop detail components internally.

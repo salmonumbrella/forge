@@ -5,6 +5,37 @@ back to TOML.
 
 - `configFile` in `internal/config/config.go` is the hand-maintained subset of `Config` that `Save` writes to disk. A `Config` field absent from `configFile` (or from the `Save` initializer) loads from TOML fine but is silently dropped on the next save or restart.
 - Every new persisted config field or section must be wired in three places — `Config`, `configFile`, and the `Save` initializer — and covered by a save/load round-trip test with a non-default value (see `TestPullRequestsConfigRoundTrip` in `internal/config/config_test.go`).
+- Omitted `fleet.role` means `coordinator`; an explicit `node` role and its
+  coordinator binding must survive whole-file saves together
+  (`internal/config/config.go::Fleet.RoleOrDefault`, `internal/config/config.go::Config.Save`).
+- `fleet.members` is coordinator-only active metadata keyed by stable node ID
+  and canonical HTTPS origin. Enrollment does not change the startup-bound role;
+  `fleet prepare-node` saves node role under the daemon's config mutation locks
+  only after matching the durable seal; abort may reset an unactivated node
+  (`internal/config/config.go::Fleet.Validate`,
+  `internal/server/node_preparation.go::Server.persistPreparedNodeRole`,
+  `internal/server/settings_routes.go::Server.resetPreparedNodeBinding`).
+- Unsupported fleet fields fail config loading through the undecoded-key gate.
+  Do not add migration parsing or derive node identity from removed display
+  metadata; operators must remove unsupported fields and enroll nodes explicitly
+  (`internal/config/config.go::rejectUnsupportedConfigKeys`).
+- Enrollment records, opaque preparation seals, and federation bearers live in
+  0600 atomic JSON stores under `data_dir`, not TOML; settings and CLI output
+  must never expose bearers or seals
+  (`internal/federation/enrollment_store.go::DefaultStorePath`,
+  `internal/federationauth/store.go::DefaultStorePath`).
+- A node's settings response composes coordinator-owned provider policy with
+  node-owned execution policy. Each node settings write must target exactly one
+  owner; mixed-owner requests fail before either side changes. Node-local writes
+  fetch their coordinator projection before saving, so a failed response never
+  hides a committed local mutation (`internal/server/settings_handlers.go::Server.updateSettings`,
+  `internal/server/settings_handlers.go::Server.updateLocalSettings`).
+- Fleet preference writes never accept role, coordinator, or member state;
+  those fields change only through enrollment and preparation workflows
+  (`internal/server/settings_routes.go::Server.updateFleetSettings`).
+- `fleet setup` reloads under the shared config lifecycle lock and never moves
+  `data_dir` or writes enrollment-owned node role/binding state
+  (`internal/fleetsetup/setup.go::Runner.Apply`).
 - `activity.use_workspace_activity_for_recency` is one global PR, Issue, and Activity opt-in. Its zero value is intentionally false; successful settings writes and file reloads publish the committed value to handler snapshots (`internal/server/server.go::pullConfigSnapshot`).
 - `detail.initial_timeline_entry_limit` is a global PR/issue presentation preference.
   Omitted or zero values default to 50; explicit values must remain within 10-250

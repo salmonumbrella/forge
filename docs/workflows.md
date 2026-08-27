@@ -132,9 +132,9 @@ pull and publish, and Kata reference behavior.
 
 ## Use a fleet
 
-A hub can combine snapshots from other kenn-forge daemons. Supported actions
-route back to the machine that owns the resource. Sessions expose local or
-remote attach commands.
+A coordinator combines snapshots from enrolled kenn-forge nodes. Supported
+actions route back to the machine that owns the resource, and terminal traffic
+uses the node's WebSocket API.
 
-Use HTTP on a trusted private network. Use SSH when the peer should not expose
-its listener. See [Federated fleet](federated-fleet.md).
+Each daemon must have a reachable HTTPS origin. Forge does not use SSH for
+fleet transport or daemon startup. See [Federated fleet](federated-fleet.md).
